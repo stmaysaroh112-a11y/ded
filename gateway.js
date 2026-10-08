@@ -7,7 +7,10 @@ const { launchCamoufox } = require('./camoufox_launch');
 const { Redis } = require('@upstash/redis');
 require('dotenv').config({ path: path.join(__dirname, '.env') });
 const chatgptModule = require('./platforms/chatgpt');
-const poolBrowser = require('./pool_browser');
+let poolBrowser = null;
+try { poolBrowser = require('./pool_browser'); } catch (e) {
+    console.log('[POOL] modul tidak ada — cold start only:', e.message);
+}
 
 const xvfb = spawn('Xvfb', [':99', '-screen', '0', '1280x800x24']);
 process.env.DISPLAY = ':99';
@@ -253,10 +256,10 @@ app.post('/api/generate', async (req, res) => {
 
     if (fileArray && fileArray.length > 0) {
         fileArray.forEach((fileObj, index) => {
-            const matches = fileObj.base64.match(/^data:(.+);base64,(.+)$/);
+            const matches = fileObj.base64 && fileObj.base64.match(/^data:(.+);base64,(.+)$/);
             if (matches && matches.length === 3) {
                 const buffer = Buffer.from(matches[2], 'base64');
-                let originalExt = path.extname(fileObj.name);
+                let originalExt = path.extname(fileObj.name || '');
                 if (!originalExt) originalExt = '.bin';
 
                 const safeName = `upload_${Date.now()}_${index}${originalExt}`;
@@ -271,35 +274,32 @@ app.post('/api/generate', async (req, res) => {
     try {
         const activeUrl = await redis.get('active_gateway_url') || `http://localhost:${PORT}`;
 
-        // --- PATH A: pool browser ready (skip cold start chatgpt.com) ---
-        const slot = poolBrowser.acquireReadySlot();
-        if (slot) {
-            console.log(`[GATEWAY] ⚡ Pool slot#${slot.id} | cookie=${slot.cookieId} | aktif=${jumlahTugasAktif} | stats=${JSON.stringify(poolBrowser.poolStats())}`);
-            try {
-                const { hasil, cookieId } = await poolBrowser.runTaskOnSlot(slot, {
-                    action,
-                    prompt,
-                    isThinkingMode,
-                    translatedFiles,
-                    folderHasil,
-                });
-                res.json({
-                    status: 'success',
-                    worker: cookieId,
-                    network: 'pool',
-                    text: hasil.text,
-                    fileUrls: (hasil.files || []).map(f => `${activeUrl}/files/${f}`),
-                });
-                return;
-            } catch (poolErr) {
-                console.error(`[GATEWAY] ⚠️ Pool slot gagal, fallback cold: ${poolErr.message}`);
-                // jatuh ke PATH B
+        // Pool opsional: hanya jika modul ada + slot ready
+        if (poolBrowser && typeof poolBrowser.acquireReadySlot === 'function') {
+            const slot = poolBrowser.acquireReadySlot();
+            if (slot) {
+                console.log(`[GATEWAY] ⚡ Pool slot#${slot.id} cookie=${slot.cookieId}`);
+                try {
+                    const { hasil, cookieId } = await poolBrowser.runTaskOnSlot(slot, {
+                        action, prompt, isThinkingMode, translatedFiles, folderHasil,
+                    });
+                    res.json({
+                        status: 'success',
+                        worker: cookieId,
+                        network: 'pool',
+                        text: hasil.text,
+                        fileUrls: (hasil.files || []).map(f => `${activeUrl}/files/${f}`),
+                    });
+                    return;
+                } catch (poolErr) {
+                    console.error(`[GATEWAY] ⚠️ Pool gagal, cold start: ${poolErr.message}`);
+                }
             }
         }
 
-        // --- PATH B: cold start seperti biasa ---
+        // Cold start — jalur utama (sama seperti gateway asli)
         const sesi = await dapatkanSesiCookie();
-        console.log(`[GATEWAY] 🚀 Cold start | Pekerja Aktif: ${jumlahTugasAktif} | Akun: ${sesi.id} | net=${proxyMode} | pool=${JSON.stringify(poolBrowser.poolStats())}`);
+        console.log(`[GATEWAY] 🚀 Meluncurkan tugas | Pekerja Aktif: ${jumlahTugasAktif} | Akun: ${sesi.id} | net=${proxyMode}`);
 
         const launched = await launchGatewayBrowser();
         browser = launched.browser;
@@ -379,9 +379,20 @@ async function jalankanDemoAwal(activeUrl) {
             }
             console.log(`======================================================\n`);
 
-            // QC OK + tunnel dipublikasikan → baru nyalakan pool 5 browser
-            console.log(`[POOL] QC sukses — mengaktifkan pool browser...`);
-            poolBrowser.startPool().catch((e) => console.error('[POOL] start gagal:', e.message));
+            // Setelah QC sukses + URL publik: nyalakan pool (opsional, tidak mengganggu QC)
+            if (poolBrowser && typeof poolBrowser.setDeps === 'function') {
+                try {
+                    poolBrowser.setDeps({
+                        launchGatewayBrowser,
+                        dapatkanSesiCookie,
+                        chatgptModule,
+                    });
+                    console.log(`[POOL] QC sukses — mengaktifkan pool browser...`);
+                    poolBrowser.startPool().catch((e) => console.error('[POOL] start gagal:', e.message));
+                } catch (e) {
+                    console.error('[POOL] init gagal:', e.message);
+                }
+            }
             return;
         } catch (error) {
             console.error(`[SYSTEM-DEMO] ❌ Percobaan ${attempt}/${MAX_QC_TRIES} gagal: ${error.message}`);
