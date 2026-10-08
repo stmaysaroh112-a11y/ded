@@ -388,7 +388,7 @@ async function jalankanDemoAwal(activeUrl) {
                         chatgptModule,
                     });
                     console.log(`[POOL] QC sukses — mengaktifkan pool browser...`);
-                    poolBrowser.startPool().catch((e) => console.error('[POOL] start gagal:', e.message));
+                    poolBrowser.startPool(folderHasil).catch((e) => console.error('[POOL] start gagal:', e.message));
                 } catch (e) {
                     console.error('[POOL] init gagal:', e.message);
                 }
