@@ -46,7 +46,7 @@ async function stepShot(page, folderHasil, label) {
 // =====================================================================
 // 👤 TUNGGU PROFIL SIAP (dari Script 2)
 // =====================================================================
-async function tungguProfilSiap(page, timeoutMs = 60000) {
+async function tungguProfilSiap(page, timeoutMs = 45000) {
     console.log('[CHATGPT] 👤 Menunggu profil sidebar siap...');
     const t0 = Date.now();
     let ok = false;
@@ -123,7 +123,10 @@ async function tungguProfilSiap(page, timeoutMs = 60000) {
         await page.waitForTimeout(300);
     }
 
-    if (!ok) console.log(`[CHATGPT] ⚠️ Timeout profil — lanjut`);
+    if (!ok) {
+        console.log(`[CHATGPT] ❌ Timeout profil ${timeoutMs}ms — hentikan`);
+        throw new Error('PROFIL_TIMEOUT: Profil sidebar tidak terdeteksi dalam ' + timeoutMs + 'ms. Cookie/sesi mungkin invalid.');
+    }
 }
 
 // =====================================================================
@@ -162,25 +165,55 @@ async function eksekusiChatGPT(tipeTugas, promptTeks, isThinkingMode, fileInputD
     const page = await context.newPage();
     await page.setViewportSize({ width: 1920, height: 1080 });
 
-    // 🌟 SISTEM PEMBUNUH POP-UP OTONOM
+    // 🌟 SISTEM PEMBUNUH POP-UP OTONOM (selalu nyala, termasuk memory NUX)
     await page.addInitScript(() => {
-        const observer = new MutationObserver(() => {
+        const dismissPopups = () => {
             const btns = document.querySelectorAll('button');
-            for (let btn of btns) {
+            for (const btn of btns) {
                 const txt = (btn.textContent || '').trim().toLowerCase();
-                if (txt === 'got it' || txt === '知道了' || txt === 'okay' || txt === 'ok' || txt === 'stay logged out' || txt === 'continue') {
-                    try { btn.click(); } catch(e) {}
+                if (
+                    txt === 'got it' ||
+                    txt === '知道了' ||
+                    txt === 'okay' ||
+                    txt === 'ok' ||
+                    txt === 'stay logged out' ||
+                    txt === 'continue'
+                ) {
+                    try { btn.click(); } catch (e) {}
                 }
-                if (btn.querySelector('svg') && (btn.getAttribute('aria-label') === 'Close' || btn.getAttribute('aria-label') === 'Tutup')) {
-                    try { btn.click(); } catch(e) {}
+                if (
+                    btn.querySelector('svg') &&
+                    (btn.getAttribute('aria-label') === 'Close' || btn.getAttribute('aria-label') === 'Tutup')
+                ) {
+                    try { btn.click(); } catch (e) {}
                 }
             }
-            const dialogs = document.querySelectorAll('[role="dialog"]');
-            dialogs.forEach(d => {
-                if(d.innerText.includes('More relevant') || d.innerText.includes('个性化') || d.innerText.includes('already uploaded')) d.remove();
+
+            // Dialog radix / memory NUX: "More relevant, personalized replies"
+            document.querySelectorAll('[role="dialog"]').forEach((d) => {
+                const t = d.innerText || '';
+                if (
+                    t.includes('More relevant') ||
+                    t.includes('personalized replies') ||
+                    t.includes('个性化') ||
+                    t.includes('already uploaded')
+                ) {
+                    const gotIt = Array.from(d.querySelectorAll('button')).find((b) =>
+                        /^\s*got it\s*$/i.test((b.textContent || '').trim())
+                    );
+                    if (gotIt) {
+                        try { gotIt.click(); } catch (e) {}
+                    } else {
+                        try { d.remove(); } catch (e) {}
+                    }
+                }
             });
-        });
-        observer.observe(document, { childList: true, subtree: true });
+        };
+
+        const observer = new MutationObserver(() => dismissPopups());
+        observer.observe(document.documentElement, { childList: true, subtree: true });
+        setInterval(dismissPopups, 800);
+        dismissPopups();
     });
 
     try {
@@ -195,7 +228,7 @@ async function eksekusiChatGPT(tipeTugas, promptTeks, isThinkingMode, fileInputD
         // ---------------------------------------------------------
         // 2) Tunggu profil (dari Local)
         // ---------------------------------------------------------
-        await tungguProfilSiap(page, 60000);
+        await tungguProfilSiap(page, 45000);
         await stepShot(page, folderHasil, '02_after_profile');
 
         // ---------------------------------------------------------
