@@ -305,25 +305,30 @@ async function jalankanDemoAwal(activeUrl) {
 
     console.log(`\n[SYSTEM-DEMO] 🚀 Tes QC ChatGPT (maks ${MAX_QC_TRIES} kali, jeda ${QC_RETRY_MS / 1000}s)...`);
 
-    let sesi;
-    try {
-        sesi = await dapatkanSesiCookie();
-    } catch (e) {
-        console.error(`[SYSTEM-DEMO] ❌ Gagal ambil cookie: ${e.message}`);
-        console.log(`[SYSTEM-DEMO] ⚠️ URL Cloudflare DITAHAN.\n`);
-        return;
-    }
-
     const promptDemo = 'Berikan satu kalimat sapaan selamat datang yang sangat lucu, sedikit nyeleneh, dan penuh semangat untuk Bosku.';
 
     for (let attempt = 1; attempt <= MAX_QC_TRIES; attempt++) {
         let browser;
         let context;
+        let sesi;
         try {
             if (attempt > 1) {
-                console.log(`[SYSTEM-DEMO] ↻ Coba lagi ${attempt}/${MAX_QC_TRIES} (proxy fox / QC gagal)...`);
+                console.log(`[SYSTEM-DEMO] ↻ Coba lagi ${attempt}/${MAX_QC_TRIES} (cookie baru + proxy)...`);
                 monitorProxy();
                 await new Promise((r) => setTimeout(r, QC_RETRY_MS));
+            }
+
+            // Setiap percobaan ambil cookie berikutnya (index Redis naik).
+            // Cookie kadaluarsa tidak dipakai berulang di 3x QC.
+            try {
+                sesi = await dapatkanSesiCookie();
+            } catch (e) {
+                console.error(`[SYSTEM-DEMO] ❌ Gagal ambil cookie attempt ${attempt}: ${e.message}`);
+                if (attempt >= MAX_QC_TRIES) {
+                    console.log(`[SYSTEM-DEMO] ⚠️ URL Cloudflare DITAHAN.\n`);
+                    return;
+                }
+                continue;
             }
 
             const launched = await launchGatewayBrowser();
