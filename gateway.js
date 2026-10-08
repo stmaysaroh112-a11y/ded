@@ -7,6 +7,7 @@ const { launchCamoufox } = require('./camoufox_launch');
 const { Redis } = require('@upstash/redis');
 require('dotenv').config({ path: path.join(__dirname, '.env') });
 const chatgptModule = require('./platforms/chatgpt');
+const poolBrowser = require('./pool_browser');
 
 const xvfb = spawn('Xvfb', [':99', '-screen', '0', '1280x800x24']);
 process.env.DISPLAY = ':99';
@@ -268,8 +269,37 @@ app.post('/api/generate', async (req, res) => {
 
     let browser, context;
     try {
+        const activeUrl = await redis.get('active_gateway_url') || `http://localhost:${PORT}`;
+
+        // --- PATH A: pool browser ready (skip cold start chatgpt.com) ---
+        const slot = poolBrowser.acquireReadySlot();
+        if (slot) {
+            console.log(`[GATEWAY] ⚡ Pool slot#${slot.id} | cookie=${slot.cookieId} | aktif=${jumlahTugasAktif} | stats=${JSON.stringify(poolBrowser.poolStats())}`);
+            try {
+                const { hasil, cookieId } = await poolBrowser.runTaskOnSlot(slot, {
+                    action,
+                    prompt,
+                    isThinkingMode,
+                    translatedFiles,
+                    folderHasil,
+                });
+                res.json({
+                    status: 'success',
+                    worker: cookieId,
+                    network: 'pool',
+                    text: hasil.text,
+                    fileUrls: (hasil.files || []).map(f => `${activeUrl}/files/${f}`),
+                });
+                return;
+            } catch (poolErr) {
+                console.error(`[GATEWAY] ⚠️ Pool slot gagal, fallback cold: ${poolErr.message}`);
+                // jatuh ke PATH B
+            }
+        }
+
+        // --- PATH B: cold start seperti biasa ---
         const sesi = await dapatkanSesiCookie();
-        console.log(`[GATEWAY] 🚀 Meluncurkan tugas | Pekerja Aktif: ${jumlahTugasAktif} | Akun: ${sesi.id} | net=${proxyMode}`);
+        console.log(`[GATEWAY] 🚀 Cold start | Pekerja Aktif: ${jumlahTugasAktif} | Akun: ${sesi.id} | net=${proxyMode} | pool=${JSON.stringify(poolBrowser.poolStats())}`);
 
         const launched = await launchGatewayBrowser();
         browser = launched.browser;
@@ -278,7 +308,6 @@ app.post('/api/generate', async (req, res) => {
 
         const hasil = await chatgptModule.eksekusiChatGPT(action, prompt, isThinkingMode, translatedFiles, folderHasil, context);
 
-        const activeUrl = await redis.get('active_gateway_url') || `http://localhost:${PORT}`;
         res.json({
             status: 'success',
             worker: sesi.id,
@@ -349,6 +378,10 @@ async function jalankanDemoAwal(activeUrl) {
                 console.log(`[SYSTEM] 🟢 TAUTAN CLOUDFLARE DIBUKA: Vercel dialihkan ke mesin ini.`);
             }
             console.log(`======================================================\n`);
+
+            // QC OK + tunnel dipublikasikan → baru nyalakan pool 5 browser
+            console.log(`[POOL] QC sukses — mengaktifkan pool browser...`);
+            poolBrowser.startPool().catch((e) => console.error('[POOL] start gagal:', e.message));
             return;
         } catch (error) {
             console.error(`[SYSTEM-DEMO] ❌ Percobaan ${attempt}/${MAX_QC_TRIES} gagal: ${error.message}`);
