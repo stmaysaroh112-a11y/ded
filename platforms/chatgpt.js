@@ -185,38 +185,32 @@ async function eksekusiChatGPT(tipeTugas, promptTeks, isThinkingMode, fileInputD
 
     try {
         // ---------------------------------------------------------
-        // 1) Navigasi — SELALU ke chatgpt.com (cara Script 1)
+        // 1) Navigasi
         // ---------------------------------------------------------
         console.log(`\n[CHATGPT] 🌐 Membuka ChatGPT...`);
-        await page.goto('https://chatgpt.com/', { waitUntil: 'domcontentloaded', timeout: 90000 }).catch(() => {});
+        await page.goto('https://chatgpt.com/', { waitUntil: 'domcontentloaded', timeout: 90000 }).catch(()=>{});
         await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
         await stepShot(page, folderHasil, '01_after_goto');
 
         // ---------------------------------------------------------
-        // 2) Tunggu profil (dari Script 2)
+        // 2) Tunggu profil (dari Local)
         // ---------------------------------------------------------
         await tungguProfilSiap(page, 60000);
         await stepShot(page, folderHasil, '02_after_profile');
 
         // ---------------------------------------------------------
-        // 3) Tunggu composer (dari Script 2)
+        // 3) Tunggu composer (dari Local)
         // ---------------------------------------------------------
         await tungguComposerSiap(page, 60000);
         await stepShot(page, folderHasil, '03_composer_ready');
         await page.waitForTimeout(800);
 
-        // ---------------------------------------------------------
-        // 4) Thinking Mode
-        // ---------------------------------------------------------
         if (isThinkingMode) {
-            console.log('[CHATGPT] 🧠 Thinking Mode (Ctrl+Shift+M)...');
+            console.log(`[CHATGPT] 🧠 Mengaktifkan Thinking Mode...`);
             await page.keyboard.press('Control+Shift+M');
             await page.waitForTimeout(800);
         }
 
-        // ---------------------------------------------------------
-        // 5) Aktifkan Mode Gambar (cara Script 1 — klik tombol)
-        // ---------------------------------------------------------
         if (tipeTugas === 'GAMBAR') {
             console.log(`[CHATGPT] 🎨 Mengaktifkan Mode Generasi Gambar...`);
             try {
@@ -230,7 +224,7 @@ async function eksekusiChatGPT(tipeTugas, promptTeks, isThinkingMode, fileInputD
                     return {x: rect.x + rect.width/2, y: rect.y + rect.height/2};
                 }, plusBtnSelector);
                 
-                if (plusBox) {
+                if(plusBox) {
                     await page.mouse.click(plusBox.x, plusBox.y);
                 } else {
                     await page.click(plusBtnSelector);
@@ -240,14 +234,9 @@ async function eksekusiChatGPT(tipeTugas, promptTeks, isThinkingMode, fileInputD
                 
                 const imgMenuBox = await page.evaluate(() => {
                     const spans = Array.from(document.querySelectorAll('span'));
-                    const targetSpan = spans.find(s => 
-                        s.textContent.trim().toLowerCase() === 'buat gambar' || 
-                        s.textContent.trim().toLowerCase() === 'create image'
-                    );
+                    const targetSpan = spans.find(s => s.textContent.trim().toLowerCase() === 'buat gambar' || s.textContent.trim().toLowerCase() === 'create image');
                     if (targetSpan) {
-                        const clickableDiv = targetSpan.closest('.__menu-item') || 
-                                            targetSpan.closest('div[tabindex="0"]') || 
-                                            targetSpan.parentElement;
+                        const clickableDiv = targetSpan.closest('.__menu-item') || targetSpan.closest('div[tabindex="0"]') || targetSpan.parentElement;
                         const rect = clickableDiv.getBoundingClientRect();
                         return { x: rect.x + rect.width/2, y: rect.y + rect.height/2 };
                     }
@@ -261,30 +250,29 @@ async function eksekusiChatGPT(tipeTugas, promptTeks, isThinkingMode, fileInputD
                 } 
 
                 await page.waitForTimeout(1000);
-                await page.evaluate(() => { 
-                    const textarea = document.querySelector('#prompt-textarea'); 
-                    if (textarea) { textarea.click(); textarea.focus(); } 
-                });
+                await page.evaluate(() => { const textarea = document.querySelector('#prompt-textarea'); if (textarea) { textarea.click(); textarea.focus(); } });
                 await page.waitForTimeout(500);
-                await stepShot(page, folderHasil, '03b_image_mode_activated');
             } catch (err) { 
                 console.log(`[CHATGPT] ⚠️ Peringatan aktivasi mode gambar: ${err.message}`); 
             }
         }
 
-        // ---------------------------------------------------------
-        // 6) Upload File (logika deteksi lampiran dari Script 2)
-        // ---------------------------------------------------------
+        // =================================================================
+        // 🌟 LOGIKA PELAMPIRAN DUAL-CORE (BERDASARKAN CHATGPT_1 DAN CHATGPT_2)
+        // =================================================================
         if (validFiles.length > 0) {
-            console.log(`[CHATGPT] 📎 Mengunggah ${validFiles.length} file...`);
+            console.log(`[CHATGPT] 📎 Memproses ${validFiles.length} File...`);
             
+            // Pemisahan Jenis File
             const imageExtensions = ['.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.heic'];
             const imageFiles = validFiles.filter(f => imageExtensions.includes(path.extname(f).toLowerCase()));
             const docFiles = validFiles.filter(f => !imageExtensions.includes(path.extname(f).toLowerCase()));
 
-            // Upload Dokumen
+            // -----------------------------------------------------------------
+            // JURUS 1: UPLOAD DOKUMEN (Menggunakan logika murni chatgpt_2.js)
+            // -----------------------------------------------------------------
             if (docFiles.length > 0) {
-                console.log(`[CHATGPT] 📄 Mengunggah Dokumen...`);
+                console.log(`[CHATGPT] 📄 Mengunggah Dokumen (Mode chatgpt_2.js)...`);
                 try {
                     try {
                         await page.locator('#composer-plus-btn, [data-testid="composer-plus-btn"]').click({ timeout: 3000 });
@@ -309,7 +297,7 @@ async function eksekusiChatGPT(tipeTugas, promptTeks, isThinkingMode, fileInputD
                     }
 
                     if (!nativeDocUploaded) {
-                        console.log(`[CHATGPT] ⚠️ Injeksi Clipboard untuk Dokumen...`);
+                        console.log(`[CHATGPT] ⚠️ Menggunakan Injeksi Clipboard untuk Dokumen...`);
                         await page.evaluate(() => {
                             const oldInput = document.getElementById('hacker-doc-input');
                             if (oldInput) oldInput.remove();
@@ -336,9 +324,11 @@ async function eksekusiChatGPT(tipeTugas, promptTeks, isThinkingMode, fileInputD
                 } catch (e) { console.log(`[CHATGPT] ❌ Error Dokumen: ${e.message}`); }
             }
 
-            // Upload Gambar
+            // -----------------------------------------------------------------
+            // JURUS 2: UPLOAD GAMBAR (Menggunakan logika murni chatgpt_1.js)
+            // -----------------------------------------------------------------
             if (imageFiles.length > 0) {
-                console.log(`[CHATGPT] 🖼️ Mengunggah Gambar...`);
+                console.log(`[CHATGPT] 🖼️ Mengunggah Gambar (Mode chatgpt_1.js)...`);
                 try {
                     let nativeImgUploaded = false;
                     await page.waitForSelector('input[type="file"]', { state: 'attached', timeout: 5000 }).catch(()=>{});
@@ -348,12 +338,12 @@ async function eksekusiChatGPT(tipeTugas, promptTeks, isThinkingMode, fileInputD
                         try { 
                             await input.setInputFiles(imageFiles); 
                             nativeImgUploaded = true; 
-                            break;
+                            break; // PENTING: Sesuai chatgpt_1.js
                         } catch (e) {}
                     }
 
                     if (!nativeImgUploaded) {
-                        console.log(`[CHATGPT] ⚠️ Injeksi Clipboard untuk Gambar...`);
+                        console.log(`[CHATGPT] ⚠️ Menggunakan Injeksi Clipboard untuk Gambar...`);
                         await page.evaluate(() => {
                             const oldInput = document.getElementById('hacker-image-input');
                             if (oldInput) oldInput.remove();
@@ -434,9 +424,7 @@ async function eksekusiChatGPT(tipeTugas, promptTeks, isThinkingMode, fileInputD
             await page.waitForTimeout(1000);
         }
 
-        // ---------------------------------------------------------
-        // 7) Baseline (cara Script 1)
-        // ---------------------------------------------------------
+
         const { jumlahBubbleAwal, jumlahGambarAwal } = await page.evaluate(() => {
             const genImages = Array.from(document.querySelectorAll('img[src*="backend-api/estuary"]')).filter(img => {
                 if (img.closest('.group\\/message-image')) return false;
@@ -448,11 +436,7 @@ async function eksekusiChatGPT(tipeTugas, promptTeks, isThinkingMode, fileInputD
                 jumlahGambarAwal: genImages.length
             };
         });
-        console.log(`[CHATGPT] baseline bubbles=${jumlahBubbleAwal} images=${jumlahGambarAwal}`);
 
-        // ---------------------------------------------------------
-        // 8) Suntik Prompt + Kirim
-        // ---------------------------------------------------------
         console.log(`[CHATGPT] ⚡ Menyuntikkan Prompt...`);
         const textarea = page.locator('#prompt-textarea');
         await textarea.focus();
