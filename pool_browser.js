@@ -1,109 +1,37 @@
 /**
  * pool_browser.js — 5 slot Camoufox siap di chatgpt.com (profil OK + Got it)
- * 1 slot = 1 cookie valid + 1 browser + 1 context (pending sampai tugas)
  *
- * Dipakai gateway.js: acquireReadySlot() → runTaskOnSlot() → release/rebuild
+ * Boot MIRIP gateway QC / cold path:
+ *  - launch lewat gateway.launchGatewayBrowser (proxy + prefs sama)
+ *  - cookie lewat gateway.dapatkanSesiCookie
+ *  - satu per satu (bukan 5 parallel) agar tidak tabrak resource Codespace
+ *  - bootstrap: goto → popup Got it → profil (timeout longgar)
+ *  - profil gagal → cookie berikutnya, ulangi
  */
 const path = require('path');
-const fs = require('fs');
-require('dotenv').config({ path: path.join(__dirname, '.env') });
-const { Redis } = require('@upstash/redis');
-const { launchCamoufox } = require('./camoufox_launch');
-const chatgptModule = require('./platforms/chatgpt');
 
 const POOL_SIZE = parseInt(process.env.POOL_SIZE || '5', 10);
-const PROFIL_TIMEOUT_MS = parseInt(process.env.POOL_PROFIL_TIMEOUT_MS || '45000', 10);
-const REBUILD_DELAY_MS = parseInt(process.env.POOL_REBUILD_DELAY_MS || '3000', 10);
-const MAX_COOKIES = 150;
+const PROFIL_TIMEOUT_MS = parseInt(process.env.POOL_PROFIL_TIMEOUT_MS || '90000', 10);
+const REBUILD_DELAY_MS = parseInt(process.env.POOL_REBUILD_DELAY_MS || '5000', 10);
+const BOOT_GAP_MS = parseInt(process.env.POOL_BOOT_GAP_MS || '4000', 10);
 
-const redis = new Redis({
-  url: process.env.UPSTASH_REDIS_REST_URL,
-  token: process.env.UPSTASH_REDIS_REST_TOKEN,
-});
+/** Di-inject gateway agar launch/cookie identik */
+let deps = {
+  launchGatewayBrowser: null,
+  dapatkanSesiCookie: null,
+  chatgptModule: null,
+};
 
-// Reuse proxy prefs style dari gateway (subset)
-const BD_PROXY_HOST = process.env.BD_PROXY_HOST || process.env.BRIGHTDATA_HOST || '';
-const BD_PROXY_PORT = parseInt(process.env.BD_PROXY_PORT || process.env.BRIGHTDATA_PORT || '0', 10);
-const BD_PROXY_USER = process.env.BD_PROXY_USER || process.env.BRIGHTDATA_USER || '';
-const BD_PROXY_PASS = process.env.BD_PROXY_PASS || process.env.BRIGHTDATA_PASS || '';
-const STATIC_PROXY_HOST = process.env.STATIC_PROXY_HOST || '';
-const STATIC_PROXY_PORT = parseInt(process.env.STATIC_PROXY_PORT || '0', 10);
-const STATIC_PROXY_USER = process.env.STATIC_PROXY_USER || '';
-const STATIC_PROXY_PASS = process.env.STATIC_PROXY_PASS || '';
-
-/** @type {Array<{
- *  id: number,
- *  state: 'booting'|'ready'|'busy'|'dead',
- *  browser: any,
- *  context: any,
- *  page: any,
- *  cookieId: string|null,
- *  readyAt: number|null,
- *  task: any
- * }>} */
+/** @type {Array<object>} */
 const slots = [];
-
 let started = false;
+let bootQueueRunning = false;
 
-async function dapatkanSesiCookie() {
-  let index = await redis.incr('global_chatgpt_index');
-  if (index > MAX_COOKIES) {
-    await redis.set('global_chatgpt_index', 1);
-    index = 1;
-  }
-  const cookieKey = `cookie_chatgpt_${index}`;
-  const rawData = await redis.get(cookieKey);
-  if (!rawData) throw new Error(`[POOL] Redis kosong: ${cookieKey}`);
-
-  const formattedCookies = Object.entries(rawData).map(([key, value]) => ({
-    name: key,
-    value: String(value),
-    domain: '.chatgpt.com',
-    path: '/',
-    secure: true,
-    sameSite: 'Lax',
-  }));
-  return { id: cookieKey, cookies: formattedCookies };
+function setDeps(d) {
+  deps = { ...deps, ...d };
 }
 
-async function launchBrowserForPool() {
-  const prefs = {
-    'webgl.force-enabled': true,
-    'webgl.disabled': false,
-    'dom.maxHardwareConcurrency': 8,
-    'pdfjs.disabled': true,
-  };
-  const opts = {
-    headless: true,
-    width: 1280,
-    height: 720,
-    firefoxUserPrefs: prefs,
-    block_images: false,
-    humanize: false,
-    i_know_what_im_doing: true,
-  };
-
-  if (BD_PROXY_HOST && BD_PROXY_PORT) {
-    opts.geoip = true;
-    opts.proxy = { server: `http://${BD_PROXY_HOST}:${BD_PROXY_PORT}` };
-    if (BD_PROXY_USER) opts.proxy.username = BD_PROXY_USER;
-    if (BD_PROXY_PASS) opts.proxy.password = BD_PROXY_PASS;
-  } else if (STATIC_PROXY_HOST && STATIC_PROXY_PORT) {
-    opts.geoip = true;
-    opts.proxy = { server: `http://${STATIC_PROXY_HOST}:${STATIC_PROXY_PORT}` };
-    if (STATIC_PROXY_USER) opts.proxy.username = STATIC_PROXY_USER;
-    if (STATIC_PROXY_PASS) opts.proxy.password = STATIC_PROXY_PASS;
-  } else {
-    prefs['network.proxy.type'] = 0;
-    opts.geoip = false;
-  }
-
-  return launchCamoufox(opts);
-}
-
-/** Sama konsep tungguProfilSiap + popup Got it (inline, tanpa tutup page) */
 async function bootstrapPageToProfile(page, timeoutMs) {
-  // Popup killer di page ini
   await page.addInitScript(() => {
     const dismissPopups = () => {
       const btns = document.querySelectorAll('button');
@@ -140,16 +68,35 @@ async function bootstrapPageToProfile(page, timeoutMs) {
     dismissPopups();
   });
 
-  await page.goto('https://chatgpt.com/', { waitUntil: 'domcontentloaded', timeout: 90000 }).catch(() => {});
-  await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
+  console.log('[POOL]   goto chatgpt.com...');
+  await page.goto('https://chatgpt.com/', { waitUntil: 'domcontentloaded', timeout: 90000 }).catch((e) => {
+    console.log('[POOL]   goto warn:', e.message);
+  });
+  await page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
+  await page.waitForTimeout(1500);
+
+  // Composer dulu (lebih stabil daripada profil saja di UI baru)
+  console.log('[POOL]   tunggu composer...');
+  await page.waitForSelector('#prompt-textarea, [data-testid="prompt-textarea"], div.ProseMirror[contenteditable="true"]', {
+    state: 'visible',
+    timeout: 60000,
+  }).catch(() => {});
 
   const t0 = Date.now();
   let ok = false;
+  let lastLog = 0;
   while (Date.now() - t0 < timeoutMs) {
-    // klik Got it aktif (selain init script)
+    if (page.isClosed && page.isClosed()) throw new Error('page closed');
+
     await page.evaluate(() => {
       document.querySelectorAll('[role="dialog"] button').forEach((b) => {
         if (/^\s*got it\s*$/i.test((b.textContent || '').trim())) {
+          try { b.click(); } catch (e) {}
+        }
+      });
+      document.querySelectorAll('button').forEach((b) => {
+        const t = (b.textContent || '').trim().toLowerCase();
+        if (t === 'got it' || t === 'okay' || t === 'ok' || t === 'continue') {
           try { b.click(); } catch (e) {}
         }
       });
@@ -168,74 +115,146 @@ async function bootstrapPageToProfile(page, timeoutMs) {
         aria &&
         !/^(open profile menu|buka menu profil)$/i.test(aria.trim()) &&
         aria.trim().length > 5;
+
+      // Sidebar plan text (Free/Plus) dekat Upgrade
+      let sidebarOk = false;
+      const upgradeBtn = Array.from(document.querySelectorAll('button, a, span')).find((el) =>
+        /^(Upgrade|Tingkatkan)$/i.test((el.textContent || '').trim())
+      );
+      if (upgradeBtn) {
+        let root = upgradeBtn.closest('div');
+        for (let i = 0; i < 6 && root; i++) {
+          const t = (root.innerText || '').replace(/\s+/g, ' ').trim();
+          if (/\b(Free|Plus|Pro|Team|Bebas)\b/i.test(t) && t.length < 80) {
+            sidebarOk = true;
+            break;
+          }
+          root = root.parentElement;
+        }
+      }
+
+      const composer = !!(
+        document.querySelector('#prompt-textarea') ||
+        document.querySelector('[data-testid="prompt-textarea"]') ||
+        document.querySelector('div.ProseMirror[contenteditable="true"]')
+      );
+
       return {
+        hasBtn: !!btn,
         hasImg: !!(src && src.startsWith('http')),
         ariaHasName,
+        sidebarOk,
+        composer,
       };
-    });
+    }).catch(() => ({ hasBtn: false, hasImg: false, ariaHasName: false, sidebarOk: false, composer: false }));
 
-    if (info.hasImg || info.ariaHasName) {
+    // Profil ketat ATAU (composer + tombol profil) setelah cookie inject
+    if (info.hasImg || info.ariaHasName || info.sidebarOk) {
       ok = true;
+      console.log(`[POOL]   profil OK ${Date.now() - t0}ms img=${info.hasImg} aria=${info.ariaHasName} side=${info.sidebarOk}`);
       break;
     }
-    await page.waitForTimeout(400);
+    // Fallback longgar: composer + profile button ada (kadang avatar lambat load)
+    if (info.composer && info.hasBtn && Date.now() - t0 > 20000) {
+      ok = true;
+      console.log(`[POOL]   profil soft-OK (composer+btn) ${Date.now() - t0}ms`);
+      break;
+    }
+
+    if (Date.now() - lastLog > 5000) {
+      lastLog = Date.now();
+      console.log(`[POOL]   menunggu profil… ${Date.now() - t0}ms btn=${info.hasBtn} composer=${info.composer}`);
+    }
+    await page.waitForTimeout(500);
   }
 
   if (!ok) throw new Error('PROFIL_TIMEOUT');
-
-  // Composer minimal siap (tidak wajib gagal total)
-  await page.waitForSelector('#prompt-textarea', { state: 'visible', timeout: 30000 }).catch(() => {});
 }
 
 async function destroySlot(slot) {
-  try { if (slot.page) await slot.page.close().catch(() => {}); } catch (_) {}
-  try { if (slot.context) await slot.context.close().catch(() => {}); } catch (_) {}
-  try { if (slot.browser) await slot.browser.close().catch(() => {}); } catch (_) {}
+  const page = slot.page;
+  const context = slot.context;
+  const browser = slot.browser;
   slot.page = null;
   slot.context = null;
   slot.browser = null;
   slot.cookieId = null;
   slot.readyAt = null;
   slot.state = 'dead';
+  try { if (page) await page.close().catch(() => {}); } catch (_) {}
+  try { if (context) await context.close().catch(() => {}); } catch (_) {}
+  try { if (browser) await browser.close().catch(() => {}); } catch (_) {}
 }
 
-async function bootSlot(slot) {
+async function bootSlotOnce(slot) {
+  if (!deps.launchGatewayBrowser || !deps.dapatkanSesiCookie) {
+    throw new Error('pool deps belum di-set (launchGatewayBrowser / dapatkanSesiCookie)');
+  }
+
   slot.state = 'booting';
   slot.task = null;
-  console.log(`[POOL] slot#${slot.id} booting...`);
+  console.log(`[POOL] slot#${slot.id} booting (cara gateway)...`);
 
+  await destroySlot(slot);
+
+  const sesi = await deps.dapatkanSesiCookie();
+  console.log(`[POOL] slot#${slot.id} cookie=${sesi.id}`);
+
+  const launched = await deps.launchGatewayBrowser();
+  const browser = launched.browser;
+  const context = await browser.newContext({ acceptDownloads: true });
+  await context.addCookies(sesi.cookies);
+  const page = await context.newPage();
+  await page.setViewportSize({ width: 1920, height: 1080 });
+
+  try {
+    await bootstrapPageToProfile(page, PROFIL_TIMEOUT_MS);
+  } catch (e) {
+    try { await page.close().catch(() => {}); } catch (_) {}
+    try { await context.close().catch(() => {}); } catch (_) {}
+    try { await browser.close().catch(() => {}); } catch (_) {}
+    throw e;
+  }
+
+  slot.browser = browser;
+  slot.context = context;
+  slot.page = page;
+  slot.cookieId = sesi.id;
+  slot.readyAt = Date.now();
+  slot.state = 'ready';
+  console.log(`[POOL] slot#${slot.id} READY cookie=${sesi.id} net=${launched.label}`);
+}
+
+async function bootSlotLoop(slot) {
   for (;;) {
+    if (slot.state === 'busy') return;
     try {
-      await destroySlot(slot);
-      const sesi = await dapatkanSesiCookie();
-      const browser = await launchBrowserForPool();
-      const context = await browser.newContext({ acceptDownloads: true });
-      await context.addCookies(sesi.cookies);
-      const page = await context.newPage();
-      await page.setViewportSize({ width: 1920, height: 1080 });
-
-      await bootstrapPageToProfile(page, PROFIL_TIMEOUT_MS);
-
-      slot.browser = browser;
-      slot.context = context;
-      slot.page = page;
-      slot.cookieId = sesi.id;
-      slot.readyAt = Date.now();
-      slot.state = 'ready';
-      console.log(`[POOL] slot#${slot.id} READY cookie=${sesi.id}`);
+      await bootSlotOnce(slot);
       return;
     } catch (e) {
-      console.log(`[POOL] slot#${slot.id} boot gagal (${e.message}) — cookie lain...`);
+      console.log(`[POOL] slot#${slot.id} boot gagal (${e.message}) — cookie lain dalam ${REBUILD_DELAY_MS}ms`);
       await destroySlot(slot);
       await new Promise((r) => setTimeout(r, REBUILD_DELAY_MS));
-      // ulangi sampai dapat profil valid
     }
   }
 }
 
-/**
- * Ambil satu slot ready (atomik). Return null jika tidak ada.
- */
+/** Boot slot berurutan — hindari 5 Camoufox parallel di Codespace */
+async function bootAllSequential() {
+  if (bootQueueRunning) return;
+  bootQueueRunning = true;
+  try {
+    for (const slot of slots) {
+      if (slot.state === 'ready' || slot.state === 'busy') continue;
+      await bootSlotLoop(slot);
+      await new Promise((r) => setTimeout(r, BOOT_GAP_MS));
+    }
+  } finally {
+    bootQueueRunning = false;
+  }
+  console.log(`[POOL] boot batch selesai:`, poolStats());
+}
+
 function acquireReadySlot() {
   const slot = slots.find((s) => s.state === 'ready');
   if (!slot) return null;
@@ -245,25 +264,25 @@ function acquireReadySlot() {
 
 function poolStats() {
   const c = { ready: 0, busy: 0, booting: 0, dead: 0 };
-  for (const s of slots) c[s.state] = (c[s.state] || 0) + 1;
+  for (const s of slots) {
+    if (c[s.state] !== undefined) c[s.state]++;
+    else c[s.state] = 1;
+  }
   return c;
 }
 
-/**
- * Jalankan tugas pada slot yang sudah di-acquire.
- * Setelah selesai slot di-rebuild (browser bekas tidak dipakai ulang untuk tugas berikutnya).
- */
 async function runTaskOnSlot(slot, { action, prompt, isThinkingMode, translatedFiles, folderHasil }) {
   if (!slot || slot.state !== 'busy') throw new Error('slot tidak busy');
+  if (!deps.chatgptModule) throw new Error('chatgptModule deps belum di-set');
 
-  // Tutup page bootstrap — eksekusiChatGPT buka page baru di context yang sama (cookies tetap)
+  // Page bootstrap ditutup; eksekusiChatGPT buka page baru di context yang sama (cookie tetap)
   try {
     if (slot.page) await slot.page.close().catch(() => {});
     slot.page = null;
   } catch (_) {}
 
   try {
-    const hasil = await chatgptModule.eksekusiChatGPT(
+    const hasil = await deps.chatgptModule.eksekusiChatGPT(
       action,
       prompt,
       isThinkingMode,
@@ -273,17 +292,26 @@ async function runTaskOnSlot(slot, { action, prompt, isThinkingMode, translatedF
     );
     return { hasil, cookieId: slot.cookieId };
   } finally {
-    // Selalu rebuild slot setelah tugas (sukses/gagal) agar state bersih + cookie baru
     const id = slot.id;
-    console.log(`[POOL] slot#${id} selesai tugas → rebuild`);
-    bootSlot(slot).catch((e) => console.error(`[POOL] rebuild slot#${id}:`, e.message));
+    console.log(`[POOL] slot#${id} selesai tugas → rebuild sequential`);
+    slot.state = 'dead';
+    destroySlot(slot)
+      .then(() => bootSlotLoop(slot))
+      .catch((e) => console.error(`[POOL] rebuild slot#${id}:`, e.message));
   }
 }
 
 async function startPool() {
-  if (started) return;
+  if (started) {
+    console.log('[POOL] sudah started, skip');
+    return;
+  }
+  if (!deps.launchGatewayBrowser || !deps.dapatkanSesiCookie) {
+    console.error('[POOL] start ditolak: deps belum di-set dari gateway');
+    return;
+  }
   started = true;
-  console.log(`[POOL] start size=${POOL_SIZE}`);
+  console.log(`[POOL] start size=${POOL_SIZE} (sequential, launch=gateway)`);
   for (let i = 0; i < POOL_SIZE; i++) {
     slots.push({
       id: i + 1,
@@ -296,9 +324,7 @@ async function startPool() {
       task: null,
     });
   }
-  // boot paralel
-  await Promise.all(slots.map((s) => bootSlot(s)));
-  console.log(`[POOL] semua slot siap:`, poolStats());
+  await bootAllSequential();
 }
 
 function isPoolReady() {
@@ -306,6 +332,7 @@ function isPoolReady() {
 }
 
 module.exports = {
+  setDeps,
   startPool,
   acquireReadySlot,
   runTaskOnSlot,
