@@ -131,30 +131,16 @@ async function tungguProfilSiap(page, timeoutMs) {
       };
     }).catch(() => ({ hasBtn: false, hasImg: false, ariaHasName: false, sidebarName: '', composer: false }));
 
-    if (info.hasImg) {
-      ok = true;
-      console.log(`[POOL] ✅ Profil via foto ${Date.now() - t0}ms`);
-      break;
-    }
-    if (info.ariaHasName) {
-      ok = true;
-      console.log(`[POOL] ✅ Profil via aria ${Date.now() - t0}ms`);
-      break;
-    }
+    // Hanya profil via sidebar yang diterima (Free/Plus/Pro/Team/Bebas di dekat Upgrade)
     if (info.sidebarName && /\b(Free|Plus|Pro|Team|Bebas)\b/i.test(info.sidebarName)) {
       ok = true;
       console.log(`[POOL] ✅ Profil via sidebar ${Date.now() - t0}ms`);
       break;
     }
-    if (info.hasBtn && info.composer && Date.now() - t0 > 12000) {
-      ok = true;
-      console.log(`[POOL] ✅ Profil soft (btn+composer) ${Date.now() - t0}ms`);
-      break;
-    }
 
     if (Date.now() - lastLog > 2500) {
       lastLog = Date.now();
-      console.log(`[POOL] profil… ${Date.now() - t0}ms hasBtn=${info.hasBtn} composer=${info.composer}`);
+      console.log(`[POOL] profil… ${Date.now() - t0}ms hasBtn=${info.hasBtn} sidebar=${!!info.sidebarName} composer=${info.composer}`);
     }
     await page.waitForTimeout(300);
   }
