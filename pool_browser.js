@@ -53,7 +53,12 @@ async function installPopupKiller(page) {
       }
       document.querySelectorAll('[role="dialog"]').forEach((d) => {
         const t = d.innerText || '';
-        if (t.includes('More relevant') || t.includes('personalized replies') || t.includes('个性化')) {
+        if (
+          t.includes('More relevant') ||
+          t.includes('personalized replies') ||
+          t.includes('个性化') ||
+          t.includes('already uploaded')
+        ) {
           const gotIt = Array.from(d.querySelectorAll('button')).find((b) =>
             /^\s*got it\s*$/i.test((b.textContent || '').trim())
           );
@@ -65,11 +70,60 @@ async function installPopupKiller(page) {
         }
       });
     };
-    const observer = new MutationObserver(() => dismissPopups());
-    observer.observe(document.documentElement, { childList: true, subtree: true });
-    setInterval(dismissPopups, 800);
+    if (!window.__poolPopupKillerInstalled) {
+      window.__poolPopupKillerInstalled = true;
+      const observer = new MutationObserver(() => dismissPopups());
+      observer.observe(document.documentElement, { childList: true, subtree: true });
+      setInterval(dismissPopups, 800);
+    }
     dismissPopups();
   });
+}
+
+/** Node-side: tetap klik Got it selama slot READY (pending tunggu tugas) */
+function startKeepAlivePopupGuard(slot) {
+  stopKeepAlivePopupGuard(slot);
+  const tick = async () => {
+    if (slot.state !== 'ready' || !slot.page) return;
+    try {
+      if (typeof slot.page.isClosed === 'function' && slot.page.isClosed()) return;
+      const clicked = await slot.page.evaluate(() => {
+        let n = 0;
+        document.querySelectorAll('button').forEach((b) => {
+          const t = (b.textContent || '').trim().toLowerCase();
+          if (t === 'got it' || t === 'okay' || t === 'ok' || t === 'continue' || t === 'stay logged out') {
+            try { b.click(); n++; } catch (e) {}
+          }
+        });
+        document.querySelectorAll('[role="dialog"]').forEach((d) => {
+          const text = d.innerText || '';
+          if (text.includes('More relevant') || text.includes('personalized replies') || text.includes('个性化')) {
+            const gotIt = Array.from(d.querySelectorAll('button')).find((b) =>
+              /^\s*got it\s*$/i.test((b.textContent || '').trim())
+            );
+            if (gotIt) {
+              try { gotIt.click(); n++; } catch (e) {}
+            }
+          }
+        });
+        return n;
+      });
+      if (clicked > 0) {
+        console.log(`[POOL] slot#${slot.id} keep-alive: klik popup x${clicked}`);
+      }
+    } catch (_) {
+      // page navigasi / transient — abaikan
+    }
+  };
+  slot._keepAliveTimer = setInterval(tick, 1000);
+  tick();
+}
+
+function stopKeepAlivePopupGuard(slot) {
+  if (slot && slot._keepAliveTimer) {
+    clearInterval(slot._keepAliveTimer);
+    slot._keepAliveTimer = null;
+  }
 }
 
 /** Deteksi profil — selaras chatgpt.js + soft btn+composer */
@@ -165,6 +219,7 @@ async function tungguComposerSiap(page, timeoutMs) {
 }
 
 async function destroySlot(slot) {
+  stopKeepAlivePopupGuard(slot);
   const { page, context, browser } = slot;
   slot.page = null;
   slot.context = null;
@@ -226,7 +281,8 @@ async function bootSlotOnce(slot, folderHasil) {
   slot.cookieId = sesi.id;
   slot.readyAt = Date.now();
   slot.state = 'ready';
-  console.log(`[POOL] slot#${slot.id} READY cookie=${sesi.id} net=${launched.label} (page held)`);
+  startKeepAlivePopupGuard(slot);
+  console.log(`[POOL] slot#${slot.id} READY cookie=${sesi.id} net=${launched.label} (page held, popup guard on)`);
 }
 
 async function bootSlotLoop(slot, folderHasil) {
@@ -255,6 +311,7 @@ async function bootAllSequential(folderHasil) {
 function acquireReadySlot() {
   const slot = slots.find((s) => s.state === 'ready' && slotPageAlive(s));
   if (!slot) return null;
+  stopKeepAlivePopupGuard(slot);
   slot.state = 'busy';
   return slot;
 }
@@ -290,6 +347,16 @@ async function runTaskOnSlot(slot, { action, prompt, isThinkingMode, translatedF
     if (!/chatgpt\.com/i.test(url)) {
       throw new Error('page tidak di chatgpt.com — rebuild');
     }
+
+    // Bersihkan popup yang sempat muncul saat pending
+    await page.evaluate(() => {
+      document.querySelectorAll('button').forEach((b) => {
+        const t = (b.textContent || '').trim().toLowerCase();
+        if (t === 'got it' || t === 'okay' || t === 'ok' || t === 'continue') {
+          try { b.click(); } catch (e) {}
+        }
+      });
+    }).catch(() => {});
 
     // Composer harus ada
     await page.waitForSelector('#prompt-textarea, [data-testid="prompt-textarea"], div.ProseMirror[contenteditable="true"]', {
