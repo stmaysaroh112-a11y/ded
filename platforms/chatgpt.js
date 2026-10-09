@@ -44,6 +44,84 @@ async function stepShot(page, folderHasil, label) {
 }
 
 // =====================================================================
+// 🧹 KLIK GOT IT / MENGERTI (Playwright — andal untuk React)
+// =====================================================================
+async function klikGotItJikaAda(page) {
+    let n = 0;
+    try {
+        // 1) Role/dialog scoped — paling spesifik
+        const candidates = [
+            page.getByRole('button', { name: /^got it$/i }),
+            page.getByRole('button', { name: /^mengerti$/i }),
+            page.getByRole('button', { name: /^saya mengerti$/i }),
+            page.getByRole('button', { name: /^okay$/i }),
+            page.getByRole('button', { name: /^ok$/i }),
+            page.locator('[role="dialog"] button.btn-primary'),
+            page.locator('[role="dialog"] button[class*="btn-primary"]'),
+            page.locator('button:has-text("Got it")'),
+            page.locator('button:has-text("Mengerti")'),
+        ];
+        for (const loc of candidates) {
+            const count = await loc.count().catch(() => 0);
+            for (let i = 0; i < Math.min(count, 3); i++) {
+                const b = loc.nth(i);
+                const vis = await b.isVisible().catch(() => false);
+                if (!vis) continue;
+                // force: true menembus overlay pointer-events
+                await b.click({ timeout: 2000, force: true }).catch(async () => {
+                    try {
+                        await b.evaluate((el) => el.click());
+                    } catch (_) {}
+                });
+                n++;
+            }
+        }
+        // 2) Evaluate fallback: dispatch events seperti user
+        const n2 = await page.evaluate(() => {
+            const match = (raw) => {
+                const t = (raw || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                return /^(got it|mengerti|saya mengerti|baik|okay|ok|continue|lanjutkan|stay logged out|知道了)$/i.test(t);
+            };
+            let c = 0;
+            const fire = (el) => {
+                try {
+                    el.dispatchEvent(new MouseEvent('pointerdown', { bubbles: true }));
+                    el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+                    el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+                    el.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+                    el.click();
+                    c++;
+                } catch (e) {}
+            };
+            document.querySelectorAll('button, [role="button"]').forEach((b) => {
+                if (match(b.textContent || b.innerText)) fire(b);
+            });
+            document.querySelectorAll('[role="dialog"], [data-state="open"]').forEach((d) => {
+                const t = d.innerText || '';
+                if (/more relevant|personalized|memori|memory|个性化/i.test(t)) {
+                    const primary =
+                        Array.from(d.querySelectorAll('button')).find((b) => match(b.textContent)) ||
+                        d.querySelector('button.btn-primary, button[class*="btn-primary"]');
+                    if (primary) fire(primary);
+                }
+            });
+            return c;
+        }).catch(() => 0);
+        n += n2;
+        if (n > 0) console.log(`[CHATGPT] 🧹 Klik dismiss popup x${n}`);
+    } catch (_) {}
+    return n;
+}
+
+/** Guard Node selama page tugas hidup (bukan hanya loop profil) */
+function startChatgptPopupGuard(page) {
+    const timer = setInterval(() => {
+        klikGotItJikaAda(page).catch(() => {});
+    }, 1000);
+    return () => clearInterval(timer);
+}
+
+// =====================================================================
 // 👤 TUNGGU PROFIL SIAP (dari Script 2)
 // =====================================================================
 async function tungguProfilSiap(page, timeoutMs = 45000) {
@@ -115,10 +193,39 @@ async function tungguProfilSiap(page, timeoutMs = 45000) {
                 break;
             }
         }
+        // Soft: tombol profil sudah ada + composer terlihat (avatar kadang lambat)
+        if (info.hasBtn && Date.now() - t0 > 15000) {
+            const composerOk = await page.evaluate(() => {
+                const a = document.querySelector('#prompt-textarea');
+                if (a) {
+                    const st = window.getComputedStyle(a);
+                    if (st && st.display !== 'none' && st.visibility !== 'hidden') return true;
+                }
+                return !!(
+                    document.querySelector('[data-testid="prompt-textarea"]') ||
+                    document.querySelector('div.ProseMirror[contenteditable="true"]')
+                );
+            }).catch(() => false);
+            if (composerOk) {
+                ok = true;
+                console.log(`[CHATGPT] ✅ Profil soft (btn+composer) ${Date.now() - t0}ms`);
+                break;
+            }
+        }
+
+        // Playwright klik Got it / Mengerti (NUX sering muncul di fase ini)
+        try {
+            const loc = page.locator('button:has-text("Got it"), button:has-text("Mengerti"), [role="dialog"] button.btn-primary');
+            const count = await loc.count();
+            for (let i = 0; i < Math.min(count, 3); i++) {
+                const b = loc.nth(i);
+                if (await b.isVisible().catch(() => false)) await b.click({ timeout: 1200 }).catch(() => {});
+            }
+        } catch (_) {}
 
         if (Date.now() - lastLog > 2500) {
             lastLog = Date.now();
-            console.log(`[CHATGPT] profil… ${Date.now() - t0}ms`);
+            console.log(`[CHATGPT] profil… ${Date.now() - t0}ms hasBtn=${info.hasBtn} img=${info.hasImg}`);
         }
         await page.waitForTimeout(300);
     }
@@ -167,18 +274,24 @@ async function eksekusiChatGPT(tipeTugas, promptTeks, isThinkingMode, fileInputD
 
     // 🌟 SISTEM PEMBUNUH POP-UP OTONOM (selalu nyala, termasuk memory NUX)
     await page.addInitScript(() => {
+        const isDismissLabel = (raw) => {
+            const t = (raw || '').replace(/\s+/g, ' ').trim().toLowerCase();
+            return (
+                t === 'got it' ||
+                t === 'mengerti' ||
+                t === 'saya mengerti' ||
+                t === 'baik' ||
+                t === 'okay' ||
+                t === 'ok' ||
+                t === 'continue' ||
+                t === 'lanjutkan' ||
+                t === 'stay logged out' ||
+                t === '知道了'
+            );
+        };
         const dismissPopups = () => {
-            const btns = document.querySelectorAll('button');
-            for (const btn of btns) {
-                const txt = (btn.textContent || '').trim().toLowerCase();
-                if (
-                    txt === 'got it' ||
-                    txt === '知道了' ||
-                    txt === 'okay' ||
-                    txt === 'ok' ||
-                    txt === 'stay logged out' ||
-                    txt === 'continue'
-                ) {
+            document.querySelectorAll('button, [role="button"]').forEach((btn) => {
+                if (isDismissLabel(btn.textContent || btn.innerText)) {
                     try { btn.click(); } catch (e) {}
                 }
                 if (
@@ -187,35 +300,31 @@ async function eksekusiChatGPT(tipeTugas, promptTeks, isThinkingMode, fileInputD
                 ) {
                     try { btn.click(); } catch (e) {}
                 }
-            }
-
-            // Dialog radix / memory NUX: "More relevant, personalized replies"
-            document.querySelectorAll('[role="dialog"]').forEach((d) => {
+            });
+            document.querySelectorAll('[role="dialog"], [data-state="open"]').forEach((d) => {
                 const t = d.innerText || '';
-                if (
-                    t.includes('More relevant') ||
-                    t.includes('personalized replies') ||
-                    t.includes('个性化') ||
-                    t.includes('already uploaded')
-                ) {
+                if (/more relevant|personalized replies|个性化|already uploaded|memori|memory/i.test(t)) {
                     const gotIt = Array.from(d.querySelectorAll('button')).find((b) =>
-                        /^\s*got it\s*$/i.test((b.textContent || '').trim())
+                        isDismissLabel(b.textContent || b.innerText)
                     );
-                    if (gotIt) {
-                        try { gotIt.click(); } catch (e) {}
-                    } else {
-                        try { d.remove(); } catch (e) {}
+                    const primary = gotIt || d.querySelector('button.btn-primary, button[class*="btn-primary"]');
+                    if (primary) {
+                        try { primary.click(); } catch (e) {}
                     }
                 }
             });
         };
 
-        const observer = new MutationObserver(() => dismissPopups());
-        observer.observe(document.documentElement, { childList: true, subtree: true });
-        setInterval(dismissPopups, 800);
+        if (!window.__chatgptPopupKillerInstalled) {
+            window.__chatgptPopupKillerInstalled = true;
+            const observer = new MutationObserver(() => dismissPopups());
+            observer.observe(document.documentElement, { childList: true, subtree: true });
+            setInterval(dismissPopups, 600);
+        }
         dismissPopups();
     });
 
+    const stopPopupGuard = startChatgptPopupGuard(page);
     try {
         // ---------------------------------------------------------
         // 1) Navigasi
@@ -230,6 +339,7 @@ async function eksekusiChatGPT(tipeTugas, promptTeks, isThinkingMode, fileInputD
         // ---------------------------------------------------------
         await tungguProfilSiap(page, 45000);
         await stepShot(page, folderHasil, '02_after_profile');
+        await klikGotItJikaAda(page);
 
         // ---------------------------------------------------------
         // 3) Tunggu composer (dari Local)
@@ -237,6 +347,7 @@ async function eksekusiChatGPT(tipeTugas, promptTeks, isThinkingMode, fileInputD
         await tungguComposerSiap(page, 60000);
         await stepShot(page, folderHasil, '03_composer_ready');
         await page.waitForTimeout(800);
+        await klikGotItJikaAda(page);
 
         if (isThinkingMode) {
             console.log(`[CHATGPT] 🧠 Mengaktifkan Thinking Mode...`);
@@ -470,6 +581,7 @@ async function eksekusiChatGPT(tipeTugas, promptTeks, isThinkingMode, fileInputD
             };
         });
 
+        await klikGotItJikaAda(page);
         console.log(`[CHATGPT] ⚡ Menyuntikkan Prompt...`);
         const textarea = page.locator('#prompt-textarea');
         await textarea.focus();
@@ -628,6 +740,7 @@ async function eksekusiChatGPT(tipeTugas, promptTeks, isThinkingMode, fileInputD
         } catch (screenshotErr) {}
         throw err;
     } finally {
+        try { stopPopupGuard(); } catch (_) {}
         await page.close().catch(()=>{});
     }
 }
