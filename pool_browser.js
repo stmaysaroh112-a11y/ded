@@ -87,38 +87,12 @@ function startKeepAlivePopupGuard(slot) {
     if (slot.state !== 'ready' || !slot.page) return;
     try {
       if (typeof slot.page.isClosed === 'function' && slot.page.isClosed()) return;
-      const clicked = await slot.page.evaluate(() => {
-        let n = 0;
-        document.querySelectorAll('button').forEach((b) => {
-          const t = (b.textContent || '').trim().toLowerCase();
-          if (t === 'got it' || t === 'okay' || t === 'ok' || t === 'continue' || t === 'stay logged out') {
-            try { b.click(); n++; } catch (e) {}
-          }
-        });
-        document.querySelectorAll('[role="dialog"]').forEach((d) => {
-          const text = d.innerText || '';
-          if (text.includes('More relevant') || text.includes('personalized replies') || text.includes('个性化')) {
-            const gotIt = Array.from(d.querySelectorAll('button')).find((b) =>
-              /^\s*got it\s*$/i.test((b.textContent || '').trim())
-            );
-            if (gotIt) {
-              try { gotIt.click(); n++; } catch (e) {}
-            }
-          }
-        });
-        return n;
-      });
-      if (clicked > 0) {
-        console.log(`[POOL] slot#${slot.id} keep-alive: klik popup x${clicked}`);
-      }
-    } catch (_) {
-      // page navigasi / transient — abaikan
-    }
+      await klikAreaKosong(slot.page);
+    } catch (_) {}
   };
-  slot._keepAliveTimer = setInterval(tick, 1000);
-  tick();
+  // jarang: jaga page hangat + tutup NUX tanpa deteksi
+  slot._keepAliveTimer = setInterval(tick, 8000);
 }
-
 function stopKeepAlivePopupGuard(slot) {
   if (slot && slot._keepAliveTimer) {
     clearInterval(slot._keepAliveTimer);
@@ -126,80 +100,70 @@ function stopKeepAlivePopupGuard(slot) {
   }
 }
 
-/** Deteksi profil — selaras chatgpt.js + soft btn+composer */
-async function tungguProfilSiap(page, timeoutMs) {
-  console.log('[POOL] 👤 Menunggu profil sidebar siap...');
-  const t0 = Date.now();
-  let ok = false;
-  let lastLog = 0;
-
-  while (Date.now() - t0 < timeoutMs) {
-    await page.evaluate(() => {
-      document.querySelectorAll('button').forEach((b) => {
-        const t = (b.textContent || '').trim().toLowerCase();
-        if (t === 'got it' || t === 'okay' || t === 'ok' || t === 'continue') {
-          try { b.click(); } catch (e) {}
-        }
-      });
-    }).catch(() => {});
-
-    const info = await page.evaluate(() => {
-      const btn = document.querySelector('[data-testid="accounts-profile-button"]');
-      const img = btn && (
-        btn.querySelector('img[alt="Profile image"]') ||
-        btn.querySelector('img[src*="auth0.com/avatars"]') ||
-        btn.querySelector('img[src^="http"]')
-      );
-      const src = img ? (img.getAttribute('src') || img.currentSrc || '') : '';
-      const aria = btn ? (btn.getAttribute('aria-label') || '') : '';
-      let sidebarName = '';
-      const upgradeBtn = Array.from(document.querySelectorAll('button, a, span')).find((el) =>
-        /^(Upgrade|Tingkatkan)$/i.test((el.textContent || '').trim())
-      );
-      if (upgradeBtn) {
-        let root = upgradeBtn.closest('div');
-        for (let i = 0; i < 6 && root; i++) {
-          const t = (root.innerText || '').replace(/\s+/g, ' ').trim();
-          if (/\b(Free|Plus|Pro|Team|Bebas)\b/i.test(t) && t.length < 80) {
-            sidebarName = t;
-            break;
-          }
-          root = root.parentElement;
-        }
+async function deteksiLoginAtauSignup(page) {
+  return page.evaluate(() => {
+    const texts = [];
+    document.querySelectorAll('button, a, [role="button"]').forEach((el) => {
+      const t = (el.innerText || el.textContent || el.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
+      if (t && t.length < 40) texts.push(t);
+    });
+    const body = (document.body && document.body.innerText) ? document.body.innerText.slice(0, 4000) : '';
+    for (const t of texts) {
+      if (/^(log\s*in|sign\s*up|create\s*account|masuk|daftar)$/i.test(t.trim())) {
+        return { hit: true, via: 'btn:' + t };
       }
-      const ariaHasName =
-        aria &&
-        !/^(open profile menu|buka menu profil)$/i.test(aria.trim()) &&
-        aria.trim().length > 5;
-      const composer = !!(
-        document.querySelector('#prompt-textarea') ||
+    }
+    if (/log in or sign up/i.test(body)) return { hit: true, via: 'body-auth' };
+    if (document.querySelector('[data-testid="login-button"], [data-testid="signup-button"]')) {
+      return { hit: true, via: 'testid' };
+    }
+    return { hit: false, via: '' };
+  });
+}
+
+async function klikAreaKosong(page) {
+  try {
+    const vp = page.viewportSize() || { width: 1920, height: 1080 };
+    await page.mouse.click(Math.floor(vp.width * 0.92), Math.floor(vp.height * 0.5), { delay: 40 });
+    await page.waitForTimeout(120);
+    await page.mouse.click(Math.floor(vp.width * 0.5), Math.floor(vp.height * 0.92), { delay: 40 });
+    await page.waitForTimeout(150);
+  } catch (_) {}
+}
+
+/** Cookie invalid jika Login/Sign up; valid jika composer ada tanpa auth wall */
+async function tungguSesiValid(page, timeoutMs) {
+  console.log('[POOL] 🔐 Cek sesi (login/signup = invalid)...');
+  const t0 = Date.now();
+  let lastLog = 0;
+  while (Date.now() - t0 < timeoutMs) {
+    const auth = await deteksiLoginAtauSignup(page);
+    if (auth.hit) throw new Error('COOKIE_INVALID: ' + auth.via);
+
+    const composer = await page.evaluate(() => {
+      const a = document.querySelector('#prompt-textarea');
+      if (a) {
+        const st = window.getComputedStyle(a);
+        if (st && st.display !== 'none' && st.visibility !== 'hidden') return true;
+      }
+      return !!(
         document.querySelector('[data-testid="prompt-textarea"]') ||
         document.querySelector('div.ProseMirror[contenteditable="true"]')
       );
-      return {
-        hasBtn: !!btn,
-        hasImg: !!(src && src.startsWith('http')),
-        ariaHasName,
-        sidebarName: sidebarName.slice(0, 80),
-        composer,
-      };
-    }).catch(() => ({ hasBtn: false, hasImg: false, ariaHasName: false, sidebarName: '', composer: false }));
-
-    // Hanya profil via sidebar yang diterima (Free/Plus/Pro/Team/Bebas di dekat Upgrade)
-    if (info.sidebarName && /\b(Free|Plus|Pro|Team|Bebas)\b/i.test(info.sidebarName)) {
-      ok = true;
-      console.log(`[POOL] ✅ Profil via sidebar ${Date.now() - t0}ms`);
-      break;
+    }).catch(() => false);
+    if (composer) {
+      console.log(`[POOL] ✅ Sesi OK ${Date.now() - t0}ms`);
+      return;
     }
-
     if (Date.now() - lastLog > 2500) {
       lastLog = Date.now();
-      console.log(`[POOL] profil… ${Date.now() - t0}ms hasBtn=${info.hasBtn} sidebar=${!!info.sidebarName} composer=${info.composer}`);
+      console.log(`[POOL] sesi… ${Date.now() - t0}ms`);
     }
-    await page.waitForTimeout(300);
+    await page.waitForTimeout(400);
   }
-
-  if (!ok) throw new Error('PROFIL_TIMEOUT');
+  const auth2 = await deteksiLoginAtauSignup(page);
+  if (auth2.hit) throw new Error('COOKIE_INVALID: ' + auth2.via);
+  console.log('[POOL] ⚠️ timeout sesi tanpa auth wall — lanjut');
 }
 
 async function tungguComposerSiap(page, timeoutMs) {
@@ -262,7 +226,9 @@ async function bootSlotOnce(slot, folderHasil) {
     await page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
     await stepShot(page, folderHasil, '01_after_goto');
 
-    await tungguProfilSiap(page, PROFIL_TIMEOUT_MS);
+    await klikAreaKosong(page);
+    await tungguSesiValid(page, PROFIL_TIMEOUT_MS);
+    await klikAreaKosong(page);
     await stepShot(page, folderHasil, '02_after_profile');
 
     await tungguComposerSiap(page, 60000);
@@ -469,6 +435,7 @@ async function runTaskOnSlot(slot, { action, prompt, isThinkingMode, translatedF
       };
     });
 
+    await klikAreaKosong(page);
     console.log(`[POOL] ⚡ Menyuntikkan Prompt...`);
     const textarea = page.locator('#prompt-textarea');
     await textarea.focus().catch(() => {});
