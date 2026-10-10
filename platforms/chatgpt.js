@@ -155,6 +155,48 @@ async function tungguComposerSiap(page, timeoutMs = 60000) {
 }
 
 // =====================================================================
+// 🧹 NUX memory (Got it / Mengerti) — minimal, tidak mengganggu composer
+// =====================================================================
+async function dismissNuxIfOpen(page) {
+    try {
+        const open = await page.locator(
+            '#modal-m3m-nux [data-state="open"], [data-testid="modal-m3m-nux"] [data-state="open"]'
+        ).count();
+        if (!open) return false;
+
+        const btn = page.locator(
+            '#modal-m3m-nux button.btn-primary, [data-testid="modal-m3m-nux"] button.btn-primary'
+        ).filter({ hasText: /^(Got it|Mengerti)$/i }).first();
+
+        if (await btn.count()) {
+            await btn.click({ timeout: 2000, force: true }).catch(() => {});
+            await page.waitForTimeout(300);
+        }
+
+        // Jika masih ada, hapus node modal saja (jangan sentuh body/composer)
+        const still = await page.locator(
+            '#modal-m3m-nux [data-state="open"], [data-testid="modal-m3m-nux"] [data-state="open"]'
+        ).count();
+        if (still) {
+            await page.evaluate(() => {
+                const w = document.getElementById('modal-m3m-nux') ||
+                    document.querySelector('[data-testid="modal-m3m-nux"]');
+                if (w) w.remove();
+                document.body.removeAttribute('data-scroll-locked');
+                if (document.body.style.pointerEvents === 'none') {
+                    document.body.style.pointerEvents = '';
+                }
+            }).catch(() => {});
+            await page.waitForTimeout(200);
+        }
+        console.log('[CHATGPT] 🧹 NUX dismissed');
+        return true;
+    } catch (_) {
+        return false;
+    }
+}
+
+// =====================================================================
 // 🚀 EKSEKUTOR UTAMA CHATGPT (HIBRIDA MURNI)
 // =====================================================================
 async function eksekusiChatGPT(tipeTugas, promptTeks, isThinkingMode, fileInputData, folderHasil, context) {
@@ -230,6 +272,7 @@ async function eksekusiChatGPT(tipeTugas, promptTeks, isThinkingMode, fileInputD
         // ---------------------------------------------------------
         await tungguProfilSiap(page, 45000);
         await stepShot(page, folderHasil, '02_after_profile');
+        await dismissNuxIfOpen(page);
 
         // ---------------------------------------------------------
         // 3) Tunggu composer (dari Local)
@@ -470,6 +513,7 @@ async function eksekusiChatGPT(tipeTugas, promptTeks, isThinkingMode, fileInputD
             };
         });
 
+        await dismissNuxIfOpen(page);
         console.log(`[CHATGPT] ⚡ Menyuntikkan Prompt...`);
         const textarea = page.locator('#prompt-textarea');
         await textarea.focus();
@@ -487,6 +531,7 @@ async function eksekusiChatGPT(tipeTugas, promptTeks, isThinkingMode, fileInputD
             return !(sendBtn.disabled || sendBtn.hasAttribute('disabled') || sendBtn.getAttribute('aria-disabled') === 'true'); 
         }, { timeout: 120000 }).catch(()=>{}); 
 
+        await dismissNuxIfOpen(page);
         console.log(`[CHATGPT] 🚀 Tombol Send siap! Mengirim tugas...`);
         await page.evaluate(() => { 
             const sendBtn = document.querySelector('[data-testid="send-button"]'); 
