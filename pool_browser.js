@@ -18,7 +18,7 @@ let deps = {
   dapatkanSesiCookie: null,
   chatgptModule: null,
 };
-
+ 
 const slots = [];
 let started = false;
 
@@ -415,382 +415,42 @@ function slotPageAlive(slot) {
 }
 
 /**
- * Kerjakan tugas di PAGE YANG SUDAH READY — tanpa goto / tanpa cek profil ulang.
- * Logika tugas disalin ringkas dari chatgpt.js (thinking, gambar mode, upload, prompt, send, radar, download).
+ * Kerjakan tugas di PAGE YANG SUDAH READY.
+ * Langkah task (thinking / gambar / upload / suntik / send / radar / download)
+ * = IDENTIK chatgpt.js lewat eksekusiChatGPT(..., { page, holdPage: true }).
+ * Pool hanya mengatur: HOLD page, acquire, rebuild setelah selesai.
  */
 async function runTaskOnSlot(slot, { action, prompt, isThinkingMode, translatedFiles, folderHasil }) {
   if (!slot || slot.state !== 'busy') throw new Error('slot tidak busy');
   const page = slot.page;
   const context = slot.context;
   if (!page || !context) throw new Error('slot page/context hilang');
-
-  const tipeTugas = action || 'CHAT';
-  const promptTeks = prompt || '';
-  const validFiles = (translatedFiles || []).filter((f) => fs.existsSync(f));
-  let fileTersimpanArray = [];
+  if (!deps.chatgptModule || typeof deps.chatgptModule.eksekusiChatGPT !== 'function') {
+    throw new Error('pool deps.chatgptModule belum di-set');
+  }
 
   try {
-    // Pastikan masih di chatgpt + composer hidup
     const url = page.url();
     if (!/chatgpt\.com/i.test(url)) {
       throw new Error('page tidak di chatgpt.com — rebuild');
     }
 
-    // Bersihkan popup yang sempat muncul saat pending
-    await page.evaluate(() => {
-      document.querySelectorAll('button').forEach((b) => {
-        const t = (b.textContent || '').trim().toLowerCase();
-        if (t === 'got it' || t === 'okay' || t === 'ok' || t === 'continue') {
-          try { b.click(); } catch (e) {}
-        }
-      });
-    }).catch(() => {});
+    // Keep-alive off selama tugas (hindari klik di tengah send/radar)
+    stopKeepAlivePopupGuard(slot);
 
-    // Composer harus ada
-    await page.waitForSelector('#prompt-textarea, [data-testid="prompt-textarea"], div.ProseMirror[contenteditable="true"]', {
-      state: 'visible',
-      timeout: 15000,
-    });
-
-    if (isThinkingMode) {
-      console.log(`[POOL] 🧠 Thinking Mode...`);
-      await page.keyboard.press('Control+Shift+M');
-      await page.waitForTimeout(800);
-    }
-
-    if (tipeTugas === 'GAMBAR') {
-      console.log(`[POOL] 🎨 Mode Generasi Gambar...`);
-      try {
-        const plusBtnSelector = '[data-testid="composer-plus-btn"], #composer-plus-btn';
-        await page.waitForSelector(plusBtnSelector, { state: 'visible', timeout: 5000 });
-        const plusBox = await page.evaluate((sel) => {
-          const btn = document.querySelector(sel);
-          if (!btn) return null;
-          const rect = btn.getBoundingClientRect();
-          return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
-        }, plusBtnSelector);
-        if (plusBox) await page.mouse.click(plusBox.x, plusBox.y);
-        else await page.click(plusBtnSelector);
-        await page.waitForTimeout(1500);
-        const imgMenuBox = await page.evaluate(() => {
-          const spans = Array.from(document.querySelectorAll('span'));
-          const targetSpan = spans.find(
-            (s) =>
-              s.textContent.trim().toLowerCase() === 'buat gambar' ||
-              s.textContent.trim().toLowerCase() === 'create image'
-          );
-          if (!targetSpan) return null;
-          const clickableDiv =
-            targetSpan.closest('.__menu-item') ||
-            targetSpan.closest('div[tabindex="0"]') ||
-            targetSpan.parentElement;
-          const rect = clickableDiv.getBoundingClientRect();
-          return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
-        });
-        if (imgMenuBox) {
-          await page.mouse.move(imgMenuBox.x, imgMenuBox.y, { steps: 5 });
-          await page.waitForTimeout(200);
-          await page.mouse.click(imgMenuBox.x, imgMenuBox.y);
-        }
-        await page.waitForTimeout(800);
-      } catch (err) {
-        console.log(`[POOL] ⚠️ mode gambar: ${err.message}`);
-      }
-    }
-
-    // Upload (sama JURUS chatgpt.js)
-    if (validFiles.length > 0) {
-      const imageExtensions = ['.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.heic'];
-      const imageFiles = validFiles.filter((f) => imageExtensions.includes(path.extname(f).toLowerCase()));
-      const docFiles = validFiles.filter((f) => !imageExtensions.includes(path.extname(f).toLowerCase()));
-
-      if (docFiles.length > 0) {
-        console.log(`[POOL] 📄 Upload dokumen ${docFiles.length}...`);
-        try {
-          await page.locator('#composer-plus-btn, [data-testid="composer-plus-btn"]').click({ timeout: 3000 }).catch(() => {});
-          await page.waitForTimeout(400);
-          await page.evaluate(() => {
-            document.querySelectorAll('input[type="file"]').forEach((input) => {
-              input.removeAttribute('accept');
-              input.removeAttribute('capture');
-            });
-          });
-          const fileInputs = await page.locator('input[type="file"]').all();
-          for (const input of fileInputs) {
-            try {
-              await input.setInputFiles(docFiles, { force: true });
-            } catch (_) {}
-          }
-        } catch (e) {
-          console.log(`[POOL] ❌ doc: ${e.message}`);
-        }
-      }
-
-      if (imageFiles.length > 0) {
-        console.log(`[POOL] 🖼️ Upload gambar ${imageFiles.length}...`);
-        try {
-          await page.waitForSelector('input[type="file"]', { state: 'attached', timeout: 5000 }).catch(() => {});
-          const fileInputs = await page.locator('input[type="file"]').all();
-          for (const input of fileInputs) {
-            try {
-              await input.setInputFiles(imageFiles);
-              break;
-            } catch (_) {}
-          }
-        } catch (e) {
-          console.log(`[POOL] ❌ img: ${e.message}`);
-        }
-      }
-      await page.waitForTimeout(1500);
-    }
-
-    await klikAreaKosong(page);
-    console.log(`[POOL] ⚡ Menyuntikkan Prompt...`);
-    // Sama seperti chatgpt.js → suntikPromptKeComposer
-    await suntikPromptKeComposer(page, promptTeks);
-    await page.waitForTimeout(500);
-
-    await klikAreaKosong(page);
-    console.log(`[POOL] 🚀 Mengirim tugas...`);
-    // Sama seperti chatgpt.js → klikSendAtauEnter (Enter + Stop/Working + klik send)
-    const how = await klikSendAtauEnter(page);
-    console.log(`[POOL] 📤 Send method: ${how}`);
-    await stepShot(page, folderHasil, '08_after_send');
-
-    // ===== RADAR DOM (sama seperti chatgpt.js — dari HTML send.html vs done.html) =====
-    // Generating: button[aria-label="Stop"] | [role="status"][aria-label="Working"]
-    // Done: Stop hilang + teks asisten via data-conversation-role / legacy / Copy
-    const baseline = await page.evaluate(() => {
-      const genImages = Array.from(document.querySelectorAll('img[src*="backend-api/estuary"]')).filter((img) => {
-        if (img.closest('.group\\/message-image')) return false;
-        const altText = (img.getAttribute('alt') || '').toLowerCase();
-        return img.closest('.group\\/imagegen-image') || altText.includes('generated') || altText.includes('dibuat');
-      });
-      const assistantRoles = document.querySelectorAll('[data-conversation-role="assistant"]').length;
-      const legacyAssist = document.querySelectorAll('[data-message-author-role="assistant"]').length;
-      return {
-        jumlahBubbleAwal: Math.max(assistantRoles, legacyAssist),
-        jumlahGambarAwal: genImages.length,
-        assistantRoles,
-        legacyAssist,
-      };
-    });
-    const jumlahBubbleAwal = baseline.jumlahBubbleAwal;
-    const jumlahGambarAwal = baseline.jumlahGambarAwal;
-    console.log(
-      `[POOL] 📊 Baseline radar roles=${baseline.assistantRoles} legacy=${baseline.legacyAssist} gambar=${jumlahGambarAwal}`
+    console.log(`[POOL] slot#${slot.id} → chatgpt.js eksekusi (page held)`);
+    const hasil = await deps.chatgptModule.eksekusiChatGPT(
+      action || 'CHAT',
+      prompt || '',
+      !!isThinkingMode,
+      translatedFiles || [],
+      folderHasil,
+      context,
+      { page, holdPage: true }
     );
 
-    try {
-      await page.waitForFunction(() => {
-        return !!(
-          document.querySelector('button[aria-label="Stop"]') ||
-          document.querySelector('[role="status"][aria-label="Working"]') ||
-          document.querySelector('[data-testid="stop-button"]') ||
-          document.querySelector('.result-streaming')
-        );
-      }, { timeout: 25000 });
-      console.log('[POOL] ⏳ Generasi dimulai (Stop/Working)...');
-    } catch (_) {
-      console.log('[POOL] ⚠️ Marker generate belum muncul cepat — radar tetap jalan');
-    }
-
-    console.log('\n[POOL] ⏳ Radar DOM...');
-    let hasilEktraksi = null;
-    const waktuMulai = Date.now();
-    let lastTextLen = 0;
-    let stableTicks = 0;
-
-    while (Date.now() - waktuMulai < 300000) {
-      const state = await page.evaluate((args) => {
-        const { bAwal, gAwal, mode } = args;
-        const bodyText = (document.body.innerText || '').toLowerCase();
-        if (bodyText.includes("you've reached our limit") || bodyText.includes('batas penggunaan')) {
-          return { status: 'error', msg: 'LIMIT_AKUN_TERCAPAI' };
-        }
-
-        const stopBtn = document.querySelector('button[aria-label="Stop"]');
-        const working = document.querySelector('[role="status"][aria-label="Working"]');
-        const legacyStop = document.querySelector('[data-testid="stop-button"], .result-streaming');
-        const isGenerating = !!(stopBtn || working || legacyStop);
-        if (isGenerating) {
-          return { status: 'loading', via: stopBtn ? 'aria-Stop' : working ? 'Working' : 'legacy' };
-        }
-
-        const isDoubleText = Array.from(document.querySelectorAll('p')).some((p) =>
-          (p.innerText || '').includes('Which image do you like more?')
-        );
-        const skipSpans = Array.from(document.querySelectorAll('span')).filter(
-          (s) => (s.innerText || '').trim().toLowerCase() === 'skip'
-        );
-        if (isDoubleText && skipSpans.length > 0) {
-          const skipBtn = skipSpans[0].closest('button');
-          if (skipBtn) {
-            skipBtn.click();
-            return { status: 'force_refresh', msg: 'A/B Test dilewati.' };
-          }
-        }
-
-        const getGenImages = () =>
-          Array.from(document.querySelectorAll('img[src*="backend-api/estuary"]')).filter((img) => {
-            if (img.closest('.group\\/message-image')) return false;
-            return (
-              img.closest('.group\\/imagegen-image') ||
-              (img.getAttribute('alt') || '').toLowerCase().includes('generated') ||
-              (img.getAttribute('alt') || '').toLowerCase().includes('dibuat')
-            );
-          });
-
-        const extractAssistantText = () => {
-          const legacy = Array.from(document.querySelectorAll('[data-message-author-role="assistant"]'));
-          if (legacy.length) {
-            const last = legacy[legacy.length - 1];
-            const box = last.querySelector('.markdown.prose, .markdown') || last;
-            return { text: (box.innerText || '').trim(), count: legacy.length, via: 'legacy-role' };
-          }
-          const headers = Array.from(document.querySelectorAll('[data-conversation-role="assistant"]'));
-          if (headers.length) {
-            const h = headers[headers.length - 1];
-            let root = h.closest('.group') || h.parentElement;
-            for (let i = 0; i < 4 && root; i++) {
-              const t = (root.innerText || '').replace(/^ChatGPT said:\s*/i, '').trim();
-              if (t.length > 20) return { text: t, count: headers.length, via: 'conversation-role' };
-              root = root.parentElement;
-            }
-            const t = ((h.parentElement && h.parentElement.innerText) || '')
-              .replace(/^ChatGPT said:\s*/i, '')
-              .trim();
-            return { text: t, count: headers.length, via: 'conversation-role-fallback' };
-          }
-          const copyBtns = Array.from(document.querySelectorAll('button')).filter((b) => {
-            const a = (b.getAttribute('aria-label') || b.innerText || '').toLowerCase();
-            return a === 'copy' || a.includes('copy');
-          });
-          if (copyBtns.length) {
-            const btn = copyBtns[copyBtns.length - 1];
-            let root = btn.closest('.group') || btn.parentElement;
-            for (let i = 0; i < 8 && root; i++) {
-              const t = (root.innerText || '').trim();
-              if (t.length > 40 && !t.includes('Ask ChatGPT')) {
-                return { text: t, count: copyBtns.length, via: 'copy-button-root' };
-              }
-              root = root.parentElement;
-            }
-          }
-          return { text: '', count: 0, via: 'none' };
-        };
-
-        if (mode === 'GAMBAR') {
-          const allGenImages = getGenImages();
-          if (allGenImages.length > gAwal) {
-            let uniqueImageUrls = [...new Set(allGenImages.slice(gAwal).map((img) => img.src))];
-            if (uniqueImageUrls.length > 1 || isDoubleText) uniqueImageUrls = [uniqueImageUrls[0]];
-            return { status: 'done', images: uniqueImageUrls, text: null, via: 'gambar' };
-          }
-          const extracted = extractAssistantText();
-          if (extracted.count > bAwal && extracted.text.length > 10) {
-            return {
-              status: 'done',
-              text: `⚠️ Peringatan (Gambar gagal dibuat AI):\n${extracted.text}`,
-              images: [],
-              via: extracted.via,
-            };
-          }
-          return { status: 'waiting', phase: 'gambar' };
-        }
-
-        const extracted = extractAssistantText();
-        const hasNew = extracted.count > bAwal || (bAwal === 0 && extracted.text.length > 15);
-        if (hasNew && extracted.text.length > 0) {
-          return {
-            status: 'done',
-            text: extracted.text,
-            images: [...new Set(getGenImages().map((img) => img.src))],
-            via: extracted.via,
-            textLen: extracted.text.length,
-            count: extracted.count,
-          };
-        }
-        return {
-          status: 'waiting',
-          textLen: extracted.text.length,
-          count: extracted.count,
-          via: extracted.via,
-        };
-      }, { bAwal: jumlahBubbleAwal, gAwal: jumlahGambarAwal, mode: tipeTugas });
-
-      if (state.status === 'loading') {
-        stableTicks = 0;
-      } else if (state.status === 'done') {
-        if (state.textLen && state.textLen !== lastTextLen) {
-          lastTextLen = state.textLen;
-          stableTicks = 0;
-        } else {
-          stableTicks++;
-        }
-        if (stableTicks >= 1 || !state.textLen) {
-          console.log(`[POOL] ✅ Radar done via=${state.via || '?'} len=${state.textLen || 0}`);
-          hasilEktraksi = state;
-          break;
-        }
-      } else if (state.status === 'error') {
-        throw new Error(state.msg);
-      } else if (state.status === 'force_refresh') {
-        console.log(`\n[POOL] ⚡ ${state.msg}`);
-        break;
-      }
-
-      await page.waitForTimeout(1200);
-    }
-
-    if (!hasilEktraksi) throw new Error('TIMEOUT: ChatGPT gagal memuat respon.');
-
-    // Download gambar jika ada
-    if (hasilEktraksi.images && hasilEktraksi.images.length > 0 && folderHasil) {
-      const https = require('https');
-      const http = require('http');
-      for (let i = 0; i < hasilEktraksi.images.length; i++) {
-        const imgUrl = hasilEktraksi.images[i];
-        const fileName = `chatgpt_IMG_${Date.now()}_${i + 1}.webp`;
-        const dest = path.join(folderHasil, fileName);
-        try {
-          const cookiesArray = await context.cookies();
-          const cookieStr = cookiesArray.map((c) => `${c.name}=${c.value}`).join('; ');
-          await new Promise((resolve, reject) => {
-            const lib = imgUrl.startsWith('https') ? https : http;
-            const req = lib.get(
-              imgUrl,
-              {
-                headers: {
-                  Cookie: cookieStr,
-                  'User-Agent': 'Mozilla/5.0',
-                  Referer: 'https://chatgpt.com/',
-                },
-              },
-              (res) => {
-                if (res.statusCode === 200 || res.statusCode === 206) {
-                  const file = fs.createWriteStream(dest);
-                  res.pipe(file);
-                  file.on('finish', () => {
-                    file.close();
-                    resolve(true);
-                  });
-                } else reject(new Error('HTTP ' + res.statusCode));
-              }
-            );
-            req.on('error', reject);
-            req.setTimeout(30000, () => {
-              req.destroy();
-              reject(new Error('Timeout'));
-            });
-          });
-          if (fs.existsSync(dest)) fileTersimpanArray.push(fileName);
-        } catch (_) {}
-      }
-    }
-
     return {
-      hasil: { text: hasilEktraksi.text, files: fileTersimpanArray },
+      hasil: { text: hasil && hasil.text, files: (hasil && hasil.files) || [] },
       cookieId: slot.cookieId,
     };
   } finally {
