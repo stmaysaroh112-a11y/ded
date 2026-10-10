@@ -637,18 +637,6 @@ async function eksekusiChatGPT(tipeTugas, promptTeks, isThinkingMode, fileInputD
         }
 
 
-        const { jumlahBubbleAwal, jumlahGambarAwal } = await page.evaluate(() => {
-            const genImages = Array.from(document.querySelectorAll('img[src*="backend-api/estuary"]')).filter(img => {
-                if (img.closest('.group\\/message-image')) return false;
-                const altText = (img.getAttribute('alt') || '').toLowerCase();
-                return img.closest('.group\\/imagegen-image') || altText.includes('generated') || altText.includes('dibuat');
-            });
-            return {
-                jumlahBubbleAwal: document.querySelectorAll('[data-message-author-role="assistant"], .markdown.prose').length,
-                jumlahGambarAwal: genImages.length
-            };
-        });
-
         await klikAreaKosong(page);
         console.log(`[CHATGPT] ⚡ Menyuntikkan Prompt...`);
         await suntikPromptKeComposer(page, promptTeks);
@@ -660,21 +648,79 @@ async function eksekusiChatGPT(tipeTugas, promptTeks, isThinkingMode, fileInputD
         console.log(`[CHATGPT] 📤 Send method: ${how}`);
         await stepShot(page, folderHasil, '08_after_send');
 
+        // ===== RADAR DOM (berdasarkan HTML nyata send.html vs done.html) =====
+        // Marker GENERATING (send.png / send.html):
+        //   - button[aria-label="Stop"] di composer (kotak biru stop)
+        //   - [role="status"][aria-label="Working"]
+        // Marker DONE (Done.png / done.html):
+        //   - tidak ada aria-label="Stop"
+        //   - composer kembali ke aria-label="Start Voice"
+        //   - data-conversation-role="assistant" bertambah / teks jawaban ada
+        // Catatan: UI baru TIDAK memakai data-testid="stop-button" / .result-streaming / data-message-author-role
+
+        const baseline = await page.evaluate(() => {
+            const genImages = Array.from(document.querySelectorAll('img[src*="backend-api/estuary"]')).filter(img => {
+                if (img.closest('.group\\/message-image')) return false;
+                const altText = (img.getAttribute('alt') || '').toLowerCase();
+                return img.closest('.group\\/imagegen-image') || altText.includes('generated') || altText.includes('dibuat');
+            });
+            const assistantRoles = document.querySelectorAll('[data-conversation-role="assistant"]').length;
+            const legacyAssist = document.querySelectorAll('[data-message-author-role="assistant"]').length;
+            return {
+                jumlahBubbleAwal: Math.max(assistantRoles, legacyAssist),
+                jumlahGambarAwal: genImages.length,
+                assistantRoles,
+                legacyAssist
+            };
+        });
+        const jumlahBubbleAwal = baseline.jumlahBubbleAwal;
+        const jumlahGambarAwal = baseline.jumlahGambarAwal;
+        console.log(`[CHATGPT] 📊 Baseline radar roles=${baseline.assistantRoles} legacy=${baseline.legacyAssist} gambar=${jumlahGambarAwal}`);
+
+        // Tunggu generasi mulai lewat marker UI baru
+        try {
+            await page.waitForFunction(() => {
+                return !!(
+                    document.querySelector('button[aria-label="Stop"]') ||
+                    document.querySelector('[role="status"][aria-label="Working"]') ||
+                    document.querySelector('[data-testid="stop-button"]') ||
+                    document.querySelector('.result-streaming')
+                );
+            }, { timeout: 25000 });
+            console.log('[CHATGPT] ⏳ Generasi dimulai (Stop/Working terdeteksi)...');
+        } catch (_) {
+            console.log('[CHATGPT] ⚠️ Marker generate belum muncul cepat — radar tetap jalan');
+        }
+
         console.log('\n[CHATGPT] ⏳ Mulai radar pemantauan DOM...');
         let hasilEktraksi = null;
         let waktuMulai = Date.now();
+        let lastTextLen = 0;
+        let stableTicks = 0;
 
         while (Date.now() - waktuMulai < 300000) {
             const state = await page.evaluate((args) => {
                 const { bAwal, gAwal, mode } = args;
-                
-                if (document.body.innerText.toLowerCase().includes('you\'ve reached our limit') || document.body.innerText.toLowerCase().includes('batas penggunaan')) return { status: 'error', msg: 'LIMIT_AKUN_TERCAPAI' };
+                const bodyText = (document.body.innerText || '').toLowerCase();
+                if (bodyText.includes("you've reached our limit") || bodyText.includes('batas penggunaan')) {
+                    return { status: 'error', msg: 'LIMIT_AKUN_TERCAPAI' };
+                }
 
-                const isGenerating = document.querySelector('[data-testid="stop-button"]') || document.querySelector('.result-streaming');
-                if (isGenerating) { return { status: 'loading' }; }
+                // --- generating? (UI 2025/2026) ---
+                const stopBtn = document.querySelector('button[aria-label="Stop"]');
+                const working = document.querySelector('[role="status"][aria-label="Working"]');
+                const legacyStop = document.querySelector('[data-testid="stop-button"], .result-streaming');
+                const isGenerating = !!(stopBtn || working || legacyStop);
+                if (isGenerating) {
+                    return {
+                        status: 'loading',
+                        via: stopBtn ? 'aria-Stop' : (working ? 'Working' : 'legacy')
+                    };
+                }
 
-                const isDoubleText = Array.from(document.querySelectorAll('p')).some(p => p.innerText.includes('Which image do you like more?'));
-                const skipSpans = Array.from(document.querySelectorAll('span')).filter(s => s.innerText.trim().toLowerCase() === 'skip');
+                // A/B image skip
+                const isDoubleText = Array.from(document.querySelectorAll('p')).some(p => (p.innerText || '').includes('Which image do you like more?'));
+                const skipSpans = Array.from(document.querySelectorAll('span')).filter(s => (s.innerText || '').trim().toLowerCase() === 'skip');
                 if (isDoubleText && skipSpans.length > 0) {
                     const skipBtn = skipSpans[0].closest('button');
                     if (skipBtn) { skipBtn.click(); return { status: 'force_refresh', msg: 'A/B Test dilewati.' }; }
@@ -682,70 +728,128 @@ async function eksekusiChatGPT(tipeTugas, promptTeks, isThinkingMode, fileInputD
 
                 const getGenImages = () => Array.from(document.querySelectorAll('img[src*="backend-api/estuary"]')).filter(img => {
                     if (img.closest('.group\\/message-image')) return false;
-                    return img.closest('.group\\/imagegen-image') || (img.getAttribute('alt') || '').toLowerCase().includes('generated') || (img.getAttribute('alt') || '').toLowerCase().includes('dibuat');
+                    return img.closest('.group\\/imagegen-image') ||
+                        (img.getAttribute('alt') || '').toLowerCase().includes('generated') ||
+                        (img.getAttribute('alt') || '').toLowerCase().includes('dibuat');
                 });
+
+                // Ambil teks jawaban asisten terakhir (UI baru + legacy)
+                const extractAssistantText = () => {
+                    // 1) legacy
+                    const legacy = Array.from(document.querySelectorAll('[data-message-author-role="assistant"]'));
+                    if (legacy.length) {
+                        const last = legacy[legacy.length - 1];
+                        const box = last.querySelector('.markdown.prose, .markdown') || last;
+                        return { text: (box.innerText || '').trim(), count: legacy.length, via: 'legacy-role' };
+                    }
+                    // 2) UI baru: heading data-conversation-role="assistant" lalu konten di sibling/parent group
+                    const headers = Array.from(document.querySelectorAll('[data-conversation-role="assistant"]'));
+                    if (headers.length) {
+                        const h = headers[headers.length - 1];
+                        let root = h.closest('.group') || h.parentElement;
+                        // naik sedikit untuk blok konten
+                        for (let i = 0; i < 4 && root; i++) {
+                            const t = (root.innerText || '').replace(/^ChatGPT said:\s*/i, '').trim();
+                            if (t.length > 20) return { text: t, count: headers.length, via: 'conversation-role' };
+                            root = root.parentElement;
+                        }
+                        const t = (h.parentElement && h.parentElement.innerText || '').replace(/^ChatGPT said:\s*/i, '').trim();
+                        return { text: t, count: headers.length, via: 'conversation-role-fallback' };
+                    }
+                    // 3) fallback: blok yang punya tombol Copy + Read aloud (aksi jawaban)
+                    const copyBtns = Array.from(document.querySelectorAll('button')).filter(b => {
+                        const a = (b.getAttribute('aria-label') || b.innerText || '').toLowerCase();
+                        return a === 'copy' || a.includes('copy');
+                    });
+                    if (copyBtns.length) {
+                        const btn = copyBtns[copyBtns.length - 1];
+                        let root = btn.closest('.group') || btn.parentElement;
+                        for (let i = 0; i < 8 && root; i++) {
+                            const t = (root.innerText || '').trim();
+                            if (t.length > 40 && !t.includes('Ask ChatGPT')) {
+                                return { text: t, count: copyBtns.length, via: 'copy-button-root' };
+                            }
+                            root = root.parentElement;
+                        }
+                    }
+                    return { text: '', count: 0, via: 'none' };
+                };
 
                 if (mode === 'GAMBAR') {
                     const allGenImages = getGenImages();
                     if (allGenImages.length > gAwal) {
                         const newestImage = allGenImages[allGenImages.length - 1];
-                        const container = newestImage.closest('.group\\/imagegen-image') || newestImage.parentElement.parentElement.parentElement;
+                        const container = newestImage.closest('.group\\/imagegen-image') || newestImage.parentElement?.parentElement?.parentElement;
                         const actionButtons = container ? container.querySelectorAll('button') : [];
-                        
-                        if (actionButtons.length >= 2) {
+                        // selesai gambar: tidak generating + ada url baru (tombol aksi bonus)
+                        if (actionButtons.length >= 1 || allGenImages.length > gAwal) {
                             let uniqueImageUrls = [...new Set(allGenImages.slice(gAwal).map(img => img.src))];
-                            if (uniqueImageUrls.length > 1 || isDoubleText) uniqueImageUrls = [uniqueImageUrls[0]]; 
-                            return { status: 'done', images: uniqueImageUrls, text: null };
+                            if (uniqueImageUrls.length > 1 || isDoubleText) uniqueImageUrls = [uniqueImageUrls[0]];
+                            return { status: 'done', images: uniqueImageUrls, text: null, via: 'gambar' };
                         }
-                    } 
-                    else {
-                        const messages = Array.from(document.querySelectorAll('[data-message-author-role="assistant"], .markdown.prose'));
-                        if (messages.length > bAwal) {
-                            const lastMessage = messages[messages.length - 1];
-                            const parentBlock = lastMessage.closest('[data-testid^="conversation-turn"]') || lastMessage.parentElement.parentElement;
-                            const actionButtons = parentBlock ? parentBlock.querySelectorAll('button') : [];
-
-                            if (actionButtons.length >= 2 && !document.querySelector('.result-streaming')) {
-                                const textContainer = lastMessage.querySelector('.markdown.prose') || lastMessage;
-                                let finalTxt = textContainer.innerText.trim();
-                                return { status: 'done', text: `⚠️ Peringatan (Gambar gagal dibuat AI):\n${finalTxt}`, images: [] };
-                            }
+                    } else {
+                        const extracted = extractAssistantText();
+                        if (extracted.count > bAwal && extracted.text.length > 10) {
+                            return { status: 'done', text: `⚠️ Peringatan (Gambar gagal dibuat AI):\n${extracted.text}`, images: [], via: extracted.via };
                         }
                     }
-                } 
-                else {
-                    const messages = Array.from(document.querySelectorAll('[data-message-author-role="assistant"], .markdown.prose'));
-                    if (messages.length > bAwal) {
-                        const lastMessage = messages[messages.length - 1];
-                        const parentBlock = lastMessage.closest('[data-testid^="conversation-turn"]') || lastMessage.parentElement.parentElement;
-                        const actionButtons = parentBlock ? parentBlock.querySelectorAll('button') : [];
-
-                        if (actionButtons.length >= 2 && !document.querySelector('.result-streaming')) {
-                            const hiddenElements = lastMessage.querySelectorAll('details, .thought-process, [data-testid="webpage-citation-pill"], sup');
-                            hiddenElements.forEach(el => { el._oldDisplay = el.style.display; el.style.display = 'none'; });
-                            
-                            const textContainer = lastMessage.querySelector('.markdown.prose') || lastMessage;
-                            let finalTxt = textContainer.innerText.trim();
-                            
-                            hiddenElements.forEach(el => el.style.display = el._oldDisplay || '');
-
-                            const uniqueImageUrls = [...new Set(getGenImages().map(img => img.src))];
-                            return { status: 'done', text: finalTxt, images: uniqueImageUrls };
-                        }
-                    }
+                    return { status: 'waiting', phase: 'gambar' };
                 }
-                return { status: 'waiting' };
+
+                // CHAT teks
+                const extracted = extractAssistantText();
+                const hasNew = extracted.count > bAwal || (bAwal === 0 && extracted.text.length > 15);
+                if (hasNew && extracted.text.length > 0) {
+                    return {
+                        status: 'done',
+                        text: extracted.text,
+                        images: [...new Set(getGenImages().map(img => img.src))],
+                        via: extracted.via,
+                        textLen: extracted.text.length,
+                        count: extracted.count
+                    };
+                }
+
+                return {
+                    status: 'waiting',
+                    textLen: extracted.text.length,
+                    count: extracted.count,
+                    via: extracted.via
+                };
             }, { bAwal: jumlahBubbleAwal, gAwal: jumlahGambarAwal, mode: tipeTugas });
 
-            if (state.status === 'done') { hasilEktraksi = state; break; }
-            if (state.status === 'error') throw new Error(state.msg);
-            
-            if (state.status === 'force_refresh') {
+            if (state.status === 'loading') {
+                stableTicks = 0;
+                // optional log sekali tiap ~6s
+                if ((Date.now() - waktuMulai) % 6000 < 1600) {
+                    console.log(`[CHATGPT] radar loading via=${state.via || '?'}`);
+                }
+            } else if (state.status === 'done') {
+                // Stabilisasi singkat: teks tidak boleh masih tumbuh
+                if (state.textLen && state.textLen !== lastTextLen) {
+                    lastTextLen = state.textLen;
+                    stableTicks = 0;
+                } else {
+                    stableTicks++;
+                }
+                if (stableTicks >= 1 || !state.textLen) {
+                    console.log(`[CHATGPT] ✅ Radar done via=${state.via || '?'} len=${state.textLen || 0}`);
+                    hasilEktraksi = state;
+                    break;
+                }
+            } else if (state.status === 'error') {
+                throw new Error(state.msg);
+            } else if (state.status === 'force_refresh') {
                 console.log(`\n[CHATGPT] ⚡ ${state.msg}`);
-                break; 
+                break;
+            } else {
+                // waiting
+                if ((Date.now() - waktuMulai) % 8000 < 1600) {
+                    console.log(`[CHATGPT] radar wait count=${state.count || 0} len=${state.textLen || 0} via=${state.via || '?'}`);
+                }
             }
-            
-            await page.waitForTimeout(2000); 
+
+            await page.waitForTimeout(1200);
         }
 
         if (!hasilEktraksi && tipeTugas === 'GAMBAR') {
