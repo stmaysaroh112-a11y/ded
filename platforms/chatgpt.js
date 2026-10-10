@@ -891,4 +891,3 @@ async function eksekusiChatGPT(tipeTugas, promptTeks, isThinkingMode, fileInputD
 }
 
 module.exports = { eksekusiChatGPT };
-s
