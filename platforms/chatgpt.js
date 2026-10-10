@@ -47,120 +47,61 @@ async function stepShot(page, folderHasil, label) {
 // 🧹 KLIK GOT IT / MENGERTI (Playwright — andal untuk React)
 // =====================================================================
 async function klikGotItJikaAda(page) {
-    let n = 0;
+    // Hanya dismiss modal memory NUX. Jangan Enter/Space global (bisa "memilih" tombol lain).
     try {
-        // Tombol ID: "Mengerti" | EN: "Got it" — nested text di dalam button.btn-primary
-        // Focus biru di SS = ter-focus tapi belum activate → wajib Enter/Space setelah focus
-        const locators = [
-            page.locator('#modal-m3m-nux button.btn-primary'),
-            page.locator('[data-testid="modal-m3m-nux"] button.btn-primary'),
-            page.locator('[role="dialog"][data-state="open"] button.btn-primary'),
-            page.getByRole('dialog').getByRole('button', { name: /mengerti|got it/i }),
-            page.locator('[role="dialog"] button').filter({ hasText: /^(Mengerti|Got it)$/i }),
-        ];
+        const openNux = page.locator(
+            '#modal-m3m-nux [role="dialog"][data-state="open"], [data-testid="modal-m3m-nux"] [data-state="open"], [role="dialog"][data-state="open"]'
+        ).filter({ hasText: /Mengerti|Got it|dipersonalisasi|personalized|lebih relevan|More relevant/i });
 
-        for (const loc of locators) {
-            const count = await loc.count().catch(() => 0);
-            if (!count) continue;
-            const btn = loc.first();
-            const vis = await btn.isVisible().catch(() => false);
-            if (!vis) continue;
+        if (!(await openNux.count().catch(() => 0))) return 0;
+        if (!(await openNux.first().isVisible().catch(() => false))) return 0;
 
-            try {
-                await btn.scrollIntoViewIfNeeded().catch(() => {});
-                await btn.focus({ timeout: 1000 }).catch(() => {});
-                // Activate seperti keyboard user (focus ring biru → Enter)
-                await page.keyboard.press('Enter');
-                await page.waitForTimeout(200);
-                // Double: Space juga
-                await page.keyboard.press('Space');
-                await page.waitForTimeout(150);
-                // Playwright click force
-                await btn.click({ timeout: 2000, force: true }).catch(() => {});
-                n++;
-                break;
-            } catch (_) {}
+        const btn = openNux.locator('button.btn-primary').filter({ hasText: /^(Mengerti|Got it)$/i }).first();
+        if (!(await btn.count().catch(() => 0))) {
+            // fallback: primary di dialog yang sama
+            const alt = openNux.locator('button.btn-primary').first();
+            if (!(await alt.count().catch(() => 0))) return 0;
+            await alt.click({ timeout: 2000, force: true });
+        } else {
+            await btn.click({ timeout: 2000, force: true });
         }
 
-        // Evaluate: pointer sequence + keyboard pada elemen focused
-        const n2 = await page.evaluate(() => {
-            let c = 0;
+        // Tunggu dialog hilang sebentar
+        await page.locator('#modal-m3m-nux [role="dialog"][data-state="open"], [data-testid="modal-m3m-nux"] [data-state="open"]')
+            .first()
+            .waitFor({ state: 'hidden', timeout: 3000 })
+            .catch(() => {});
+
+        // Pastikan body tidak terkunci pointer-events (efek sisa NUX)
+        await page.evaluate(() => {
             const body = document.body;
-            body.style.pointerEvents = 'auto';
-
-            const pick = () => {
-                const roots = [
-                    document.querySelector('#modal-m3m-nux'),
-                    document.querySelector('[data-testid="modal-m3m-nux"]'),
-                    ...document.querySelectorAll('[role="dialog"][data-state="open"]'),
-                ].filter(Boolean);
-                for (const root of roots) {
-                    const primary = root.querySelector('button.btn-primary');
-                    if (primary) {
-                        const t = (primary.innerText || '').replace(/\s+/g, ' ').trim().toLowerCase();
-                        if (t.includes('mengerti') || t.includes('got it') || t === '') return primary;
-                    }
-                    for (const b of root.querySelectorAll('button')) {
-                        const t = (b.innerText || '').replace(/\s+/g, ' ').trim().toLowerCase();
-                        if (t === 'mengerti' || t === 'got it') return b;
-                    }
+            if (body.getAttribute('data-scroll-locked') === '1') {
+                // hanya unlock jika modal NUX sudah tidak ada
+                if (!document.querySelector('#modal-m3m-nux [data-state="open"], [data-testid="modal-m3m-nux"] [data-state="open"]')) {
+                    body.removeAttribute('data-scroll-locked');
+                    if (body.style.pointerEvents === 'none') body.style.pointerEvents = '';
                 }
-                return null;
-            };
-
-            const el = pick();
-            if (!el) return 0;
-
-            try {
-                el.focus();
-                // Keyboard activate
-                el.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
-                el.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
-                // Pointer
-                const r = el.getBoundingClientRect();
-                const x = r.left + r.width / 2;
-                const y = r.top + r.height / 2;
-                for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
-                    el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y }));
-                }
-                el.click();
-                c++;
-            } catch (e) {}
-
-            // Masih open? hapus modal
-            const open = document.querySelector('#modal-m3m-nux [data-state="open"], [data-testid="modal-m3m-nux"] [data-state="open"], [role="dialog"][data-state="open"]');
-            if (open && /mengerti|got it|personalized|dipersonalisasi|lebih relevan/i.test(open.innerText || '')) {
-                const wrap = document.getElementById('modal-m3m-nux') || document.querySelector('[data-testid="modal-m3m-nux"]');
-                if (wrap) {
-                    try { wrap.remove(); c++; } catch (e) {}
-                } else {
-                    try { open.remove(); c++; } catch (e) {}
-                }
-                body.removeAttribute('data-scroll-locked');
-                body.style.pointerEvents = '';
             }
-            return c;
-        }).catch(() => 0);
-        n += n2;
+        }).catch(() => {});
 
-        // Verifikasi dialog sudah hilang; jika belum, Escape
-        const still = await page.locator('#modal-m3m-nux [role="dialog"][data-state="open"], [data-testid="modal-m3m-nux"] [data-state="open"]').count().catch(() => 0);
-        if (still > 0) {
-            await page.keyboard.press('Escape').catch(() => {});
-            await page.waitForTimeout(200);
-            await page.keyboard.press('Enter').catch(() => {});
-            n++;
-        }
-
-        if (n > 0) console.log(`[CHATGPT] 🧹 Dismiss NUX (Mengerti/Got it) x${n}`);
-    } catch (_) {}
-    return n;
+        console.log('[CHATGPT] 🧹 NUX dismissed (Mengerti/Got it)');
+        return 1;
+    } catch (_) {
+        return 0;
+    }
 }
 
 function startChatgptPopupGuard(page) {
-    const timer = setInterval(() => {
-        klikGotItJikaAda(page).catch(() => {});
-    }, 1000);
+    const timer = setInterval(async () => {
+        try {
+            // Cek murah dulu — jangan ganggu page kalau tidak ada NUX
+            const has = await page.locator(
+                '#modal-m3m-nux [data-state="open"], [data-testid="modal-m3m-nux"] [data-state="open"]'
+            ).count().catch(() => 0);
+            if (!has) return;
+            await klikGotItJikaAda(page);
+        } catch (_) {}
+    }, 2500);
     return () => clearInterval(timer);
 }
 
@@ -256,15 +197,7 @@ async function tungguProfilSiap(page, timeoutMs = 45000) {
             }
         }
 
-        // Playwright klik Got it / Mengerti (NUX sering muncul di fase ini)
-        try {
-            const loc = page.locator('button:has-text("Got it"), button:has-text("Mengerti"), [role="dialog"] button.btn-primary');
-            const count = await loc.count();
-            for (let i = 0; i < Math.min(count, 3); i++) {
-                const b = loc.nth(i);
-                if (await b.isVisible().catch(() => false)) await b.click({ timeout: 1200 }).catch(() => {});
-            }
-        } catch (_) {}
+        await klikGotItJikaAda(page);
 
         if (Date.now() - lastLog > 2500) {
             lastLog = Date.now();
