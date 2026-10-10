@@ -294,74 +294,84 @@ async function suntikPromptKeComposer(page, promptTeks) {
 }
 
 /**
- * Status tombol kanan composer (4 macam):
- * - send_ready  : prompt terisi, siap diklik (Send / Kirim / data-testid=send-button)
- * - processing  : Stop — sedang memproses respon
- * - idle        : Start Voice — kolom kosong ATAU tugas sudah selesai
- * - uploading   : spinner/loading — tunggu lampiran, nanti otomatis jadi Stop
+ * Sinyal tombol composer — hanya elemen TERLIHAT (abaikan salinan hidden).
+ * Dari HTML nyata (ID + EN):
+ *   send_ready : #composer-submit-button[data-testid=send-button]  aria "Kirim perintah" | "Send" | "Send prompt"
+ *   processing : #composer-submit-button[data-testid=stop-button]  aria "Hentikan jawaban" | "Stop"
+ *   uploading  : tombol submit ber-spinner (lampiran belum selesai) — nanti berganti jadi Stop
+ *   idle       : aria "Mulai Suara" | "Start Voice"  (bukan #composer-submit-button)
+ * Selesai tugas = idle (suara) DAN tombol salin baru:
+ *   [data-testid=copy-turn-action-button] aria "Salin respons" | "Copy"
  */
 async function bacaStatusTombolComposer(page) {
     return page.evaluate(() => {
-        const form = document.querySelector('form');
-        const pool = form
-            ? Array.from(form.querySelectorAll('button'))
-            : Array.from(document.querySelectorAll('button'));
-
-        // Prioritas: tombol bulat primary di composer
-        const scored = pool.map((b) => {
-            const cls = String(b.className || '');
-            const aria = (b.getAttribute('aria-label') || '').trim();
-            const testid = (b.getAttribute('data-testid') || '').trim();
-            let score = 0;
-            if (cls.includes('size-token-button-composer')) score += 5;
-            if (cls.includes('bg-composer-primary')) score += 4;
-            if (cls.includes('rounded-full')) score += 1;
-            if (testid === 'send-button' || testid === 'stop-button') score += 6;
-            if (/^(stop|start voice|send|kirim)/i.test(aria)) score += 3;
-            return { b, cls, aria, testid, score };
-        }).filter((x) => x.score > 0);
-
-        scored.sort((a, b) => b.score - a.score);
-        const top = scored[0];
-        if (!top) return { status: 'unknown', aria: '', testid: '' };
-
-        const aria = top.aria;
-        const testid = top.testid;
-        const cls = top.cls;
-        const busy = top.b.getAttribute('aria-busy') === 'true';
-        const hasSpin = !!(
-            top.b.querySelector('.animate-spin, [class*="spinner"], [class*="loading"]') ||
-            /animate-spin|spinner|loading/i.test(cls)
+        const terlihat = (el) => {
+            if (!el || !el.isConnected) return false;
+            if (el.closest('[hidden]')) return false;
+            if (el.getAttribute('aria-hidden') === 'true') return false;
+            const r = el.getBoundingClientRect();
+            if (r.width < 4 || r.height < 4) return false;
+            let p = el;
+            while (p && p !== document.documentElement) {
+                if (p.hasAttribute && p.hasAttribute('hidden')) return false;
+                const cs = window.getComputedStyle(p);
+                if (cs.display === 'none' || cs.visibility === 'hidden') return false;
+                p = p.parentElement;
+            }
+            return true;
+        };
+        const meta = (b) => ({
+            id: b.id || '',
+            testid: b.getAttribute('data-testid') || '',
+            aria: (b.getAttribute('aria-label') || '').trim(),
+            spin: !!(
+                b.querySelector('.animate-spin, [class*="animate-spin"]') ||
+                b.getAttribute('aria-busy') === 'true'
+            )
+        });
+        const list = Array.from(document.querySelectorAll('button')).filter(terlihat).map(meta);
+        const isStop = (x) =>
+            x.testid === 'stop-button' ||
+            /^hentikan jawaban$/i.test(x.aria) ||
+            /^stop$/i.test(x.aria);
+        const isSend = (x) =>
+            !isStop(x) && (
+                x.testid === 'send-button' ||
+                /^kirim perintah$/i.test(x.aria) ||
+                /^send prompt$/i.test(x.aria) ||
+                /^send$/i.test(x.aria)
+            );
+        const isVoice = (x) =>
+            /^mulai suara$/i.test(x.aria) ||
+            /^start voice$/i.test(x.aria);
+        const isCopy = (x) =>
+            x.testid === 'copy-turn-action-button' ||
+            /^salin respons$/i.test(x.aria) ||
+            /^copy$/i.test(x.aria) ||
+            /^copy response$/i.test(x.aria) ||
+            /^copy message$/i.test(x.aria);
+        const stop = list.find(isStop);
+        const send = list.find(isSend);
+        const voice = list.find(isVoice);
+        const upload = !stop && list.find((x) =>
+            x.spin && (x.id === 'composer-submit-button' || x.testid === 'composer-submit-button') && !isSend(x) && !isVoice(x)
         );
-
-        // 2) processing — Stop
-        if (/^stop$/i.test(aria) || testid === 'stop-button') {
-            return { status: 'processing', aria, testid };
-        }
-        // legacy streaming
-        if (document.querySelector('.result-streaming') || document.querySelector('[role="status"][aria-label="Working"]')) {
-            return { status: 'processing', aria: aria || 'legacy', testid };
-        }
-        // 4) uploading — spinner / busy tanpa Stop
-        if (hasSpin || busy) {
-            return { status: 'uploading', aria, testid };
-        }
-        // 1) send_ready
-        if (
-            testid === 'send-button' ||
-            /^send\b/i.test(aria) ||
-            /^kirim\b/i.test(aria) ||
-            /send message|send prompt|kirim pesan|kirim perintah/i.test(aria)
-        ) {
-            return { status: 'send_ready', aria, testid };
-        }
-        // 3) idle — Start Voice
-        if (/start\s*voice/i.test(aria) || /suara|voice/i.test(aria)) {
-            return { status: 'idle', aria, testid };
-        }
-        // fallback: primary bulat tanpa label jelas → anggap idle jika tidak disabled send
-        return { status: 'unknown', aria, testid };
-    }).catch(() => ({ status: 'unknown', aria: '', testid: '' }));
+        const copyCount = list.filter(isCopy).length;
+        let status = 'unknown';
+        if (stop) status = 'processing';
+        else if (upload) status = 'uploading';
+        else if (send) status = 'send_ready';
+        else if (voice) status = 'idle';
+        const top = stop || upload || send || voice || {};
+        return {
+            status,
+            aria: top.aria || '',
+            testid: top.testid || '',
+            copyCount,
+            voice: !!voice,
+            stop: !!stop
+        };
+    }).catch(() => ({ status: 'unknown', aria: '', testid: '', copyCount: 0, voice: false, stop: false }));
 }
 
 async function klikSendAtauEnter(page) {
@@ -370,48 +380,60 @@ async function klikSendAtauEnter(page) {
         return s.status === 'processing' || s.status === 'uploading';
     };
 
-    // Pastikan fokus di composer sebelum Enter
-    await page.evaluate(() => {
-        const el =
-            document.querySelector('#prompt-textarea') ||
-            document.querySelector('[data-testid="prompt-textarea"]') ||
-            document.querySelector('div.ProseMirror[contenteditable="true"]') ||
-            document.querySelector('[contenteditable="true"]');
-        if (el) el.focus();
-    }).catch(() => {});
-    await page.waitForTimeout(100);
-
-    // 1) Enter
-    await page.keyboard.press('Enter');
-    await page.waitForTimeout(500);
-    if (await sedangKerja()) return 'enter';
-
-    // 2) Klik tombol send (bukan Stop / Start Voice)
-    const locs = [
-        page.locator('[data-testid="send-button"]'),
-        page.getByRole('button', { name: /send prompt|kirim perintah|^send$|^kirim$/i }),
-        page.locator('button[aria-label*="Send" i]'),
-        page.locator('button[aria-label*="Kirim" i]'),
-        page.locator('form button.bg-composer-primary, button.size-token-button-composer').last(),
+    // Klik nyata tombol Kirim / Send yang terlihat — bukan Enter dulu
+    const sels = [
+        '#composer-submit-button[data-testid="send-button"]',
+        'button[data-testid="send-button"]',
+        '#composer-submit-button[aria-label="Kirim perintah"]',
+        'button[aria-label="Kirim perintah"]',
+        'button[aria-label="Send prompt"]',
+        'button[aria-label="Send"]'
     ];
-    for (const loc of locs) {
+    for (const sel of sels) {
         try {
+            const loc = page.locator(sel);
             if (!(await loc.count())) continue;
             const btn = loc.first();
             if (!(await btn.isVisible().catch(() => false))) continue;
-            const aria = (await btn.getAttribute('aria-label').catch(() => '')) || '';
-            if (/^stop$/i.test(aria) || /start\s*voice/i.test(aria)) continue;
-            await btn.click({ timeout: 2500, force: true });
-            await page.waitForTimeout(400);
-            if (await sedangKerja()) return 'click';
+            await btn.click({ timeout: 4000, force: true });
+            await page.waitForTimeout(700);
+            if (await sedangKerja()) return 'click:' + sel;
+            const st = await bacaStatusTombolComposer(page);
+            // Sudah selesai kilat: suara kembali, atau tombol kirim hilang
+            if (st.status === 'idle' || st.status === 'unknown') return 'click:' + sel;
         } catch (_) {}
     }
 
-    // 3) Enter lagi
+    const evalClick = await page.evaluate(() => {
+        const terlihat = (el) => {
+            if (!el || el.closest('[hidden]')) return false;
+            const r = el.getBoundingClientRect();
+            if (r.width < 4 || r.height < 4) return false;
+            const cs = window.getComputedStyle(el);
+            return cs.display !== 'none' && cs.visibility !== 'hidden';
+        };
+        const buttons = Array.from(document.querySelectorAll('button')).filter(terlihat);
+        const btn = buttons.find((b) => {
+            const testid = b.getAttribute('data-testid') || '';
+            const aria = (b.getAttribute('aria-label') || '').trim();
+            if (testid === 'stop-button') return false;
+            return testid === 'send-button' ||
+                aria === 'Kirim perintah' ||
+                aria === 'Send prompt' ||
+                aria === 'Send';
+        });
+        if (!btn) return false;
+        btn.click();
+        return true;
+    }).catch(() => false);
+    if (evalClick) {
+        await page.waitForTimeout(700);
+        if (await sedangKerja()) return 'eval-click';
+    }
+
     await page.keyboard.press('Enter');
-    await page.waitForTimeout(400);
-    if (await sedangKerja()) return 'enter-retry';
-    return 'enter-retry';
+    await page.waitForTimeout(500);
+    return 'enter';
 }
 
 // =====================================================================
@@ -775,21 +797,16 @@ async function eksekusiChatGPT(tipeTugas, promptTeks, isThinkingMode, fileInputD
         await suntikPromptKeComposer(page, promptTeks);
         await page.waitForTimeout(400);
 
-        console.log(`[CHATGPT] 🚀 Mengirim tugas...`);
+        const sinyalSebelumKirim = await bacaStatusTombolComposer(page);
+        const copyAwal = sinyalSebelumKirim.copyCount || 0;
+        console.log(`[CHATGPT] 🚀 Mengirim tugas... btn=${sinyalSebelumKirim.status} aria="${sinyalSebelumKirim.aria}" copyAwal=${copyAwal}`);
         const how = await klikSendAtauEnter(page);
         console.log(`[CHATGPT] 📤 Send method: ${how}`);
         await stepShot(page, folderHasil, '08_after_send');
 
-        // ===== RADAR DOM (berdasarkan HTML nyata send.html vs done.html) =====
-        // Marker GENERATING (send.png / send.html):
-        //   - button[aria-label="Stop"] di composer (kotak biru stop)
-        //   - [role="status"][aria-label="Working"]
-        // Marker DONE (Done.png / done.html):
-        //   - tidak ada aria-label="Stop"
-        //   - composer kembali ke aria-label="Start Voice"
-        //   - data-conversation-role="assistant" bertambah / teks jawaban ada
-        // Catatan: UI baru TIDAK memakai data-testid="stop-button" / .result-streaming / data-message-author-role
-
+        // Radar: selesai HANYA saat tombol suara terlihat (Mulai Suara / Start Voice)
+        // DAN tombol salin baru muncul (Salin respons / copy-turn-action-button).
+        // Selama Hentikan jawaban / stop-button atau spinner upload → masih proses.
         const baseline = await page.evaluate(() => {
             const genImages = Array.from(document.querySelectorAll('img[src*="backend-api/estuary"]')).filter(img => {
                 if (img.closest('.group\\/message-image')) return false;
@@ -853,39 +870,29 @@ async function eksekusiChatGPT(tipeTugas, promptTeks, isThinkingMode, fileInputD
         const baselineTextSnap = baseline.baselineText || '';
         console.log(`[CHATGPT] 📊 Baseline radar roles=${baseline.assistantRoles} legacy=${baseline.legacyAssist} textLen=${baselineTextLen} turns=${baseline.turnKeys || 0} gambar=${jumlahGambarAwal}`);
 
-        // Tunggu siklus tombol composer: send → (uploading?) → processing(Stop)
-        // Tidak pakai waitForFunction (hindari Timeout 30s ke CRITICAL)
-        let sawBusy = false;
-        const genDeadline = Date.now() + 45000;
-        while (Date.now() < genDeadline) {
-            const st = await bacaStatusTombolComposer(page);
-            if (st.status === 'processing' || st.status === 'uploading') {
-                sawBusy = true;
-                console.log(`[CHATGPT] ⏳ Composer ${st.status} (aria="${st.aria}")...`);
-                break;
-            }
-            await page.waitForTimeout(350);
-        }
-        if (!sawBusy) {
-            console.log('[CHATGPT] ⚠️ Belum lihat Stop/uploading — radar tetap jalan (mungkin respon sudah selesai)');
-        }
-
-        console.log('\n[CHATGPT] ⏳ Mulai radar (tombol composer + ekstrak teks/gambar)...');
+        console.log('\n[CHATGPT] ⏳ Mulai radar (Mulai Suara / Start Voice + Salin respons)...');
         let hasilEktraksi = null;
         let waktuMulai = Date.now();
         let lastTextLen = 0;
         let stableTicks = 0;
-        let everProcessing = sawBusy;
 
         while (Date.now() - waktuMulai < 300000) {
-            // Status tombol di luar evaluate — sumber kebenaran proses
             const btnSt = await bacaStatusTombolComposer(page);
             if (btnSt.status === 'processing' || btnSt.status === 'uploading') {
-                everProcessing = true;
                 if ((Date.now() - waktuMulai) % 6000 < 1400) {
-                    console.log(`[CHATGPT] radar loading via=composer:${btnSt.status}`);
+                    console.log(`[CHATGPT] radar loading via=${btnSt.status} aria="${btnSt.aria}" testid="${btnSt.testid}"`);
                 }
-                await page.waitForTimeout(1200);
+                await page.waitForTimeout(1000);
+                continue;
+            }
+
+            const copyBaru = (btnSt.copyCount || 0) > copyAwal;
+            const selesaiSinyal = btnSt.status === 'idle' && btnSt.voice && copyBaru;
+            if (!selesaiSinyal) {
+                if ((Date.now() - waktuMulai) % 8000 < 1400) {
+                    console.log(`[CHATGPT] radar wait btn=${btnSt.status} aria="${btnSt.aria}" copy=${btnSt.copyCount || 0}/${copyAwal} voice=${btnSt.voice}`);
+                }
+                await page.waitForTimeout(1000);
                 continue;
             }
 
@@ -958,8 +965,13 @@ async function eksekusiChatGPT(tipeTugas, promptTeks, isThinkingMode, fileInputD
                     }
                     // 3) Copy button dalam turn
                     const copyBtns = Array.from(document.querySelectorAll('button')).filter((b) => {
-                        const a = (b.getAttribute('aria-label') || b.innerText || '').toLowerCase();
-                        return a === 'copy' || a.includes('copy');
+                        const testid = b.getAttribute('data-testid') || '';
+                        const a = (b.getAttribute('aria-label') || b.innerText || '').trim().toLowerCase();
+                        return testid === 'copy-turn-action-button' ||
+                            a === 'salin respons' ||
+                            a === 'copy' ||
+                            a === 'copy response' ||
+                            a === 'copy message';
                     });
                     if (copyBtns.length) {
                         const btn = copyBtns[copyBtns.length - 1];
@@ -1028,25 +1040,17 @@ async function eksekusiChatGPT(tipeTugas, promptTeks, isThinkingMode, fileInputD
 
             if (state.status === 'loading') {
                 stableTicks = 0;
-            } else if (state.status === 'done') {
-                // Selesai hanya jika tombol sudah idle/send_ready (Start Voice) — bukan masih Stop
-                // Pola stabil: processing pernah terlihat ATAU teks jelas baru, lalu tombol idle
-                const tombolSelesai = btnSt.status === 'idle' || btnSt.status === 'send_ready' || btnSt.status === 'unknown';
-                if (!tombolSelesai) {
-                    stableTicks = 0;
-                    await page.waitForTimeout(800);
-                    continue;
-                }
+            } else if (state.status === 'done' || (state.images && state.images.length)) {
+                // Sinyal selesai sudah pasti: Mulai Suara + tombol Salin baru
                 if (state.textLen && state.textLen !== lastTextLen) {
                     lastTextLen = state.textLen;
                     stableTicks = 0;
                 } else {
                     stableTicks++;
                 }
-                // 2 tick stabil di idle ≈ respon final
-                if (stableTicks >= 2 || (!state.textLen && state.images && state.images.length)) {
-                    console.log(`[CHATGPT] ✅ Radar done via=${state.via || '?'} len=${state.textLen || 0} btn=${btnSt.status}`);
-                    hasilEktraksi = state;
+                if (stableTicks >= 1) {
+                    console.log(`[CHATGPT] ✅ Radar done via=${state.via || '?'} len=${state.textLen || 0} btn=${btnSt.status} aria="${btnSt.aria}" copy=${btnSt.copyCount}`);
+                    hasilEktraksi = state.status === 'done' ? state : { ...state, status: 'done', text: state.text || null };
                     break;
                 }
             } else if (state.status === 'error') {
