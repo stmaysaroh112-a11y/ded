@@ -94,14 +94,13 @@ async function klikGotItJikaAda(page) {
 function startChatgptPopupGuard(page) {
     const timer = setInterval(async () => {
         try {
-            // Cek murah dulu — jangan ganggu page kalau tidak ada NUX
             const has = await page.locator(
                 '#modal-m3m-nux [data-state="open"], [data-testid="modal-m3m-nux"] [data-state="open"]'
             ).count().catch(() => 0);
             if (!has) return;
             await klikGotItJikaAda(page);
         } catch (_) {}
-    }, 2500);
+    }, 800);
     return () => clearInterval(timer);
 }
 
@@ -570,14 +569,60 @@ async function eksekusiChatGPT(tipeTugas, promptTeks, isThinkingMode, fileInputD
             };
         });
 
-        await klikGotItJikaAda(page);
+        // NUX sering muncul TEPAT sebelum suntik — loop singkat sampai hilang
+        for (let i = 0; i < 8; i++) {
+            const hasNux = await page.locator(
+                '#modal-m3m-nux [data-state="open"], [data-testid="modal-m3m-nux"] [data-state="open"]'
+            ).count().catch(() => 0);
+            if (!hasNux) break;
+            await klikGotItJikaAda(page);
+            await page.waitForTimeout(400);
+        }
+
         console.log(`[CHATGPT] ⚡ Menyuntikkan Prompt...`);
-        const textarea = page.locator('#prompt-textarea');
-        await textarea.focus();
-        await page.evaluate((teks) => { 
-            const inputBox = document.querySelector('#prompt-textarea'); 
-            if(inputBox) document.execCommand('insertText', false, teks);
+        // Jangan pakai locator('#prompt-textarea').focus() — timeout 30s jika NUX/overlay
+        const injected = await page.evaluate((teks) => {
+            const pick = () =>
+                document.querySelector('#prompt-textarea') ||
+                document.querySelector('[data-testid="prompt-textarea"]') ||
+                document.querySelector('div.ProseMirror[contenteditable="true"]') ||
+                document.querySelector('[contenteditable="true"].ProseMirror') ||
+                document.querySelector('[contenteditable="true"]');
+            const inputBox = pick();
+            if (!inputBox) return false;
+            inputBox.focus();
+            inputBox.click();
+            try {
+                document.execCommand('selectAll', false, null);
+                document.execCommand('insertText', false, teks);
+            } catch (e) {
+                if (inputBox.tagName === 'TEXTAREA' || inputBox.tagName === 'INPUT') {
+                    inputBox.value = teks;
+                    inputBox.dispatchEvent(new Event('input', { bubbles: true }));
+                } else {
+                    inputBox.textContent = teks;
+                    inputBox.dispatchEvent(new InputEvent('input', { bubbles: true, data: teks }));
+                }
+            }
+            return true;
         }, promptTeks);
+
+        if (!injected) {
+            // Coba sekali lagi setelah dismiss
+            await klikGotItJikaAda(page);
+            await page.waitForTimeout(500);
+            const ok2 = await page.evaluate((teks) => {
+                const el =
+                    document.querySelector('#prompt-textarea') ||
+                    document.querySelector('[data-testid="prompt-textarea"]') ||
+                    document.querySelector('div.ProseMirror[contenteditable="true"]');
+                if (!el) return false;
+                el.focus();
+                try { document.execCommand('insertText', false, teks); } catch (e) {}
+                return true;
+            }, promptTeks);
+            if (!ok2) throw new Error('COMPOSER_NOT_FOUND: kolom prompt tidak bisa difokus setelah dismiss NUX');
+        }
         
         await page.waitForTimeout(1000);
 
