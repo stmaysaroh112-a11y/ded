@@ -36,78 +36,86 @@ async function stepShot(page, folderHasil, label) {
 
 async function installPopupKiller(page) {
   await page.addInitScript(() => {
-    const isDismissLabel = (raw) => {
-      const t = (raw || '').replace(/\s+/g, ' ').trim().toLowerCase();
-      return (
-        t === 'got it' ||
-        t === 'mengerti' ||
-        t === 'saya mengerti' ||
-        t === 'baik' ||
-        t === 'okay' ||
-        t === 'ok' ||
-        t === 'continue' ||
-        t === 'lanjutkan' ||
-        t === 'stay logged out' ||
-        t === '知道了'
-      );
-    };
     const dismissPopups = () => {
-      // Hanya modal NUX — jangan klik semua tombol di page
-      const nux = document.querySelector('#modal-m3m-nux, [data-testid="modal-m3m-nux"]');
-      if (!nux) return;
-      const open = nux.querySelector('[data-state="open"], [role="dialog"]');
-      if (!open) return;
-      const primary = nux.querySelector('button.btn-primary');
-      if (primary) {
-        const t = (primary.innerText || '').replace(/\s+/g, ' ').trim().toLowerCase();
-        if (t.includes('mengerti') || t.includes('got it')) {
-          try { primary.click(); } catch (e) {}
+      const btns = document.querySelectorAll('button');
+      for (const btn of btns) {
+        const txt = (btn.textContent || '').trim().toLowerCase();
+        if (
+          txt === 'got it' ||
+          txt === '知道了' ||
+          txt === 'okay' ||
+          txt === 'ok' ||
+          txt === 'stay logged out' ||
+          txt === 'continue'
+        ) {
+          try { btn.click(); } catch (e) {}
         }
       }
+      document.querySelectorAll('[role="dialog"]').forEach((d) => {
+        const t = d.innerText || '';
+        if (
+          t.includes('More relevant') ||
+          t.includes('personalized replies') ||
+          t.includes('个性化') ||
+          t.includes('already uploaded')
+        ) {
+          const gotIt = Array.from(d.querySelectorAll('button')).find((b) =>
+            /^\s*got it\s*$/i.test((b.textContent || '').trim())
+          );
+          if (gotIt) {
+            try { gotIt.click(); } catch (e) {}
+          } else {
+            try { d.remove(); } catch (e) {}
+          }
+        }
+      });
     };
     if (!window.__poolPopupKillerInstalled) {
       window.__poolPopupKillerInstalled = true;
       const observer = new MutationObserver(() => dismissPopups());
       observer.observe(document.documentElement, { childList: true, subtree: true });
-      setInterval(dismissPopups, 600);
+      setInterval(dismissPopups, 800);
     }
     dismissPopups();
   });
 }
 
-/** Node-side: hanya dismiss modal NUX saat slot READY — tidak spam focus/Enter */
+/** Node-side: tetap klik Got it selama slot READY (pending tunggu tugas) */
 function startKeepAlivePopupGuard(slot) {
   stopKeepAlivePopupGuard(slot);
   const tick = async () => {
     if (slot.state !== 'ready' || !slot.page) return;
     try {
       if (typeof slot.page.isClosed === 'function' && slot.page.isClosed()) return;
-
-      const open = slot.page.locator(
-        '#modal-m3m-nux [data-state="open"], [data-testid="modal-m3m-nux"] [data-state="open"]'
-      );
-      if (!(await open.count().catch(() => 0))) return;
-      if (!(await open.first().isVisible().catch(() => false))) return;
-
-      const btn = slot.page.locator(
-        '#modal-m3m-nux button.btn-primary, [data-testid="modal-m3m-nux"] button.btn-primary'
-      ).filter({ hasText: /^(Mengerti|Got it)$/i }).first();
-
-      if (!(await btn.count().catch(() => 0))) return;
-      if (!(await btn.isVisible().catch(() => false))) return;
-
-      await btn.click({ timeout: 2000, force: true });
-      await slot.page.evaluate(() => {
-        const body = document.body;
-        if (!document.querySelector('#modal-m3m-nux [data-state="open"], [data-testid="modal-m3m-nux"] [data-state="open"]')) {
-          body.removeAttribute('data-scroll-locked');
-          if (body.style.pointerEvents === 'none') body.style.pointerEvents = '';
-        }
-      }).catch(() => {});
-      console.log(`[POOL] slot#${slot.id} keep-alive: NUX dismissed`);
-    } catch (_) {}
+      const clicked = await slot.page.evaluate(() => {
+        let n = 0;
+        document.querySelectorAll('button').forEach((b) => {
+          const t = (b.textContent || '').trim().toLowerCase();
+          if (t === 'got it' || t === 'okay' || t === 'ok' || t === 'continue' || t === 'stay logged out') {
+            try { b.click(); n++; } catch (e) {}
+          }
+        });
+        document.querySelectorAll('[role="dialog"]').forEach((d) => {
+          const text = d.innerText || '';
+          if (text.includes('More relevant') || text.includes('personalized replies') || text.includes('个性化')) {
+            const gotIt = Array.from(d.querySelectorAll('button')).find((b) =>
+              /^\s*got it\s*$/i.test((b.textContent || '').trim())
+            );
+            if (gotIt) {
+              try { gotIt.click(); n++; } catch (e) {}
+            }
+          }
+        });
+        return n;
+      });
+      if (clicked > 0) {
+        console.log(`[POOL] slot#${slot.id} keep-alive: klik popup x${clicked}`);
+      }
+    } catch (_) {
+      // page navigasi / transient — abaikan
+    }
   };
-  slot._keepAliveTimer = setInterval(tick, 2500);
+  slot._keepAliveTimer = setInterval(tick, 1000);
   tick();
 }
 
@@ -460,18 +468,6 @@ async function runTaskOnSlot(slot, { action, prompt, isThinkingMode, translatedF
         jumlahGambarAwal: genImages.length,
       };
     });
-
-    // Popup bisa muncul setelah profil READY — bersihkan lagi sebelum suntik
-    try {
-      const loc = page.locator(
-        'button:has-text("Got it"), button:has-text("Mengerti"), button:has-text("Okay"), [role="dialog"] button.btn-primary'
-      );
-      const count = await loc.count();
-      for (let i = 0; i < Math.min(count, 5); i++) {
-        const b = loc.nth(i);
-        if (await b.isVisible().catch(() => false)) await b.click({ timeout: 2000, force: true }).catch(async () => { try { await b.evaluate((el) => el.click()); } catch (_) {} });
-      }
-    } catch (_) {}
 
     console.log(`[POOL] ⚡ Menyuntikkan Prompt...`);
     const textarea = page.locator('#prompt-textarea');
