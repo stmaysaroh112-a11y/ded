@@ -46,61 +46,90 @@ async function stepShot(page, folderHasil, label) {
 // =====================================================================
 // 🧹 KLIK GOT IT / MENGERTI (Playwright — andal untuk React)
 // =====================================================================
+async function nuxMasihTerbuka(page) {
+    const n = await page.locator(
+        '#modal-m3m-nux [role="dialog"][data-state="open"], [data-testid="modal-m3m-nux"] [data-state="open"]'
+    ).count().catch(() => 0);
+    if (n > 0) return true;
+    // fallback teks
+    return await page.evaluate(() => {
+        const d = document.querySelector('[role="dialog"][data-state="open"]');
+        if (!d) return false;
+        const t = d.innerText || '';
+        return /more relevant|personalized replies|dipersonalisasi|lebih relevan|got it|mengerti/i.test(t);
+    }).catch(() => false);
+}
+
 async function klikGotItJikaAda(page) {
-    // Hanya dismiss modal memory NUX. Jangan Enter/Space global (bisa "memilih" tombol lain).
     try {
-        const openNux = page.locator(
-            '#modal-m3m-nux [role="dialog"][data-state="open"], [data-testid="modal-m3m-nux"] [data-state="open"], [role="dialog"][data-state="open"]'
-        ).filter({ hasText: /Mengerti|Got it|dipersonalisasi|personalized|lebih relevan|More relevant/i });
+        if (!(await nuxMasihTerbuka(page))) return 0;
 
-        if (!(await openNux.count().catch(() => 0))) return 0;
-        if (!(await openNux.first().isVisible().catch(() => false))) return 0;
+        // Klik tepat primary di dalam NUX
+        const btn = page.locator(
+            '#modal-m3m-nux button.btn-primary, [data-testid="modal-m3m-nux"] button.btn-primary, [role="dialog"][data-state="open"] button.btn-primary'
+        ).filter({ hasText: /^(Got it|Mengerti)$/i }).first();
 
-        const btn = openNux.locator('button.btn-primary').filter({ hasText: /^(Mengerti|Got it)$/i }).first();
-        if (!(await btn.count().catch(() => 0))) {
-            // fallback: primary di dialog yang sama
-            const alt = openNux.locator('button.btn-primary').first();
-            if (!(await alt.count().catch(() => 0))) return 0;
-            await alt.click({ timeout: 2000, force: true });
-        } else {
-            await btn.click({ timeout: 2000, force: true });
+        if (await btn.count().catch(() => 0)) {
+            await btn.click({ timeout: 2500, force: true }).catch(() => {});
+            await page.waitForTimeout(300);
         }
 
-        // Tunggu dialog hilang sebentar
-        await page.locator('#modal-m3m-nux [role="dialog"][data-state="open"], [data-testid="modal-m3m-nux"] [data-state="open"]')
-            .first()
-            .waitFor({ state: 'hidden', timeout: 3000 })
-            .catch(() => {});
+        if (await nuxMasihTerbuka(page)) {
+            // Hard remove overlay yang mengunci page
+            await page.evaluate(() => {
+                const wrap =
+                    document.getElementById('modal-m3m-nux') ||
+                    document.querySelector('[data-testid="modal-m3m-nux"]');
+                if (wrap) wrap.remove();
+                document.querySelectorAll('[role="dialog"][data-state="open"]').forEach((d) => {
+                    const t = d.innerText || '';
+                    if (/more relevant|personalized|dipersonalisasi|lebih relevan/i.test(t)) {
+                        const root = d.closest('#modal-m3m-nux') || d.parentElement;
+                        try { (root || d).remove(); } catch (e) { try { d.remove(); } catch (_) {} }
+                    }
+                });
+                const body = document.body;
+                body.removeAttribute('data-scroll-locked');
+                if (body.style.pointerEvents === 'none') body.style.pointerEvents = '';
+                // radix focus guard spans
+                document.querySelectorAll('[data-radix-focus-guard]').forEach((el) => {
+                    try { el.remove(); } catch (e) {}
+                });
+            }).catch(() => {});
+            await page.waitForTimeout(200);
+        }
 
-        // Pastikan body tidak terkunci pointer-events (efek sisa NUX)
-        await page.evaluate(() => {
-            const body = document.body;
-            if (body.getAttribute('data-scroll-locked') === '1') {
-                // hanya unlock jika modal NUX sudah tidak ada
-                if (!document.querySelector('#modal-m3m-nux [data-state="open"], [data-testid="modal-m3m-nux"] [data-state="open"]')) {
-                    body.removeAttribute('data-scroll-locked');
-                    if (body.style.pointerEvents === 'none') body.style.pointerEvents = '';
-                }
-            }
-        }).catch(() => {});
-
-        console.log('[CHATGPT] 🧹 NUX dismissed (Mengerti/Got it)');
-        return 1;
+        const still = await nuxMasihTerbuka(page);
+        if (!still) {
+            console.log('[CHATGPT] 🧹 NUX cleared');
+            return 1;
+        }
+        console.log('[CHATGPT] ⚠️ NUX masih terbuka setelah dismiss');
+        return 0;
     } catch (_) {
         return 0;
     }
 }
 
+async function pastikanNuxHilang(page, label) {
+    for (let i = 0; i < 12; i++) {
+        if (!(await nuxMasihTerbuka(page))) return true;
+        await klikGotItJikaAda(page);
+        await page.waitForTimeout(350);
+    }
+    if (await nuxMasihTerbuka(page)) {
+        throw new Error('NUX_BLOCK: modal Got it/Mengerti masih menutupi UI saat ' + label);
+    }
+    return true;
+}
+
 function startChatgptPopupGuard(page) {
     const timer = setInterval(async () => {
         try {
-            const has = await page.locator(
-                '#modal-m3m-nux [data-state="open"], [data-testid="modal-m3m-nux"] [data-state="open"]'
-            ).count().catch(() => 0);
-            if (!has) return;
+            if (!(await nuxMasihTerbuka(page))) return;
             await klikGotItJikaAda(page);
         } catch (_) {}
-    }, 800);
+    }, 700);
     return () => clearInterval(timer);
 }
 
@@ -334,8 +363,8 @@ async function eksekusiChatGPT(tipeTugas, promptTeks, isThinkingMode, fileInputD
         // ---------------------------------------------------------
         await tungguComposerSiap(page, 60000);
         await stepShot(page, folderHasil, '03_composer_ready');
-        await page.waitForTimeout(800);
-        await klikGotItJikaAda(page);
+        await page.waitForTimeout(500);
+        await pastikanNuxHilang(page, 'setelah composer');
 
         if (isThinkingMode) {
             console.log(`[CHATGPT] 🧠 Mengaktifkan Thinking Mode...`);
@@ -569,15 +598,7 @@ async function eksekusiChatGPT(tipeTugas, promptTeks, isThinkingMode, fileInputD
             };
         });
 
-        // NUX sering muncul TEPAT sebelum suntik — loop singkat sampai hilang
-        for (let i = 0; i < 8; i++) {
-            const hasNux = await page.locator(
-                '#modal-m3m-nux [data-state="open"], [data-testid="modal-m3m-nux"] [data-state="open"]'
-            ).count().catch(() => 0);
-            if (!hasNux) break;
-            await klikGotItJikaAda(page);
-            await page.waitForTimeout(400);
-        }
+        await pastikanNuxHilang(page, 'sebelum suntik prompt');
 
         console.log(`[CHATGPT] ⚡ Menyuntikkan Prompt...`);
         // Jangan pakai locator('#prompt-textarea').focus() — timeout 30s jika NUX/overlay
@@ -626,6 +647,7 @@ async function eksekusiChatGPT(tipeTugas, promptTeks, isThinkingMode, fileInputD
         
         await page.waitForTimeout(1000);
 
+        await pastikanNuxHilang(page, 'sebelum send');
         console.log(`[CHATGPT] ⏳ Menunggu tombol Send siap...`);
         await page.waitForFunction(() => {
             const sendBtn = document.querySelector('[data-testid="send-button"]');
