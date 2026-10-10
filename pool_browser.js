@@ -7,7 +7,9 @@ const path = require('path');
 const fs = require('fs');
 
 const POOL_SIZE = parseInt(process.env.POOL_SIZE || '5', 10);
-const PROFIL_TIMEOUT_MS = parseInt(process.env.POOL_PROFIL_TIMEOUT_MS || '90000', 10);
+// Timeout cek sesi (login/signup vs composer) — 15 detik, lalu cookie berikutnya
+const SESI_TIMEOUT_MS = parseInt(process.env.POOL_SESI_TIMEOUT_MS || '15000', 10);
+const PROFIL_TIMEOUT_MS = parseInt(process.env.POOL_PROFIL_TIMEOUT_MS || String(SESI_TIMEOUT_MS), 10);
 const REBUILD_DELAY_MS = parseInt(process.env.POOL_REBUILD_DELAY_MS || '5000', 10);
 const BOOT_GAP_MS = parseInt(process.env.POOL_BOOT_GAP_MS || '4000', 10);
 
@@ -16,7 +18,7 @@ let deps = {
   dapatkanSesiCookie: null,
   chatgptModule: null,
 };
-
+ 
 const slots = [];
 let started = false;
 
@@ -36,45 +38,36 @@ async function stepShot(page, folderHasil, label) {
 
 async function installPopupKiller(page) {
   await page.addInitScript(() => {
-    const isDismissLabel = (raw) => {
-      const t = (raw || '').replace(/\s+/g, ' ').trim().toLowerCase();
-      return (
-        t === 'got it' ||
-        t === 'mengerti' ||
-        t === 'saya mengerti' ||
-        t === 'baik' ||
-        t === 'okay' ||
-        t === 'ok' ||
-        t === 'continue' ||
-        t === 'lanjutkan' ||
-        t === 'stay logged out' ||
-        t === '知道了'
-      );
-    };
     const dismissPopups = () => {
-      // 1) Semua tombol teks
-      document.querySelectorAll('button, [role="button"], a').forEach((btn) => {
-        if (isDismissLabel(btn.textContent || btn.innerText)) {
+      const btns = document.querySelectorAll('button');
+      for (const btn of btns) {
+        const txt = (btn.textContent || '').trim().toLowerCase();
+        if (
+          txt === 'got it' ||
+          txt === '知道了' ||
+          txt === 'okay' ||
+          txt === 'ok' ||
+          txt === 'stay logged out' ||
+          txt === 'continue'
+        ) {
           try { btn.click(); } catch (e) {}
         }
-      });
-      // 2) Dialog radix / memory NUX (EN + ID)
-      document.querySelectorAll('[role="dialog"], [data-state="open"]').forEach((d) => {
+      }
+      document.querySelectorAll('[role="dialog"]').forEach((d) => {
         const t = d.innerText || '';
         if (
-          /more relevant|personalized replies|个性化|already uploaded|memori|memory/i.test(t)
+          t.includes('More relevant') ||
+          t.includes('personalized replies') ||
+          t.includes('个性化') ||
+          t.includes('already uploaded')
         ) {
-          const btn = Array.from(d.querySelectorAll('button, [role="button"]')).find((b) =>
-            isDismissLabel(b.textContent || b.innerText)
+          const gotIt = Array.from(d.querySelectorAll('button')).find((b) =>
+            /^\s*got it\s*$/i.test((b.textContent || '').trim())
           );
-          if (btn) {
-            try { btn.click(); } catch (e) {}
+          if (gotIt) {
+            try { gotIt.click(); } catch (e) {}
           } else {
-            // primary button di dialog (biasanya Got it)
-            const primary = d.querySelector('button.btn-primary, button[class*="btn-primary"]');
-            if (primary) {
-              try { primary.click(); } catch (e) {}
-            }
+            try { d.remove(); } catch (e) {}
           }
         }
       });
@@ -83,7 +76,7 @@ async function installPopupKiller(page) {
       window.__poolPopupKillerInstalled = true;
       const observer = new MutationObserver(() => dismissPopups());
       observer.observe(document.documentElement, { childList: true, subtree: true });
-      setInterval(dismissPopups, 600);
+      setInterval(dismissPopups, 800);
     }
     dismissPopups();
   });
@@ -96,63 +89,12 @@ function startKeepAlivePopupGuard(slot) {
     if (slot.state !== 'ready' || !slot.page) return;
     try {
       if (typeof slot.page.isClosed === 'function' && slot.page.isClosed()) return;
-      // Playwright locator dulu (lebih andal daripada DOM click murni)
-      let n = 0;
-      try {
-        const loc = slot.page.locator(
-          'button:has-text("Got it"), button:has-text("Mengerti"), button:has-text("Okay"), button:has-text("OK"), [role="dialog"] button.btn-primary'
-        );
-        const count = await loc.count();
-        for (let i = 0; i < count; i++) {
-          const btn = loc.nth(i);
-          if (await btn.isVisible().catch(() => false)) {
-            await btn.click({ timeout: 1500 }).catch(() => {});
-            n++;
-          }
-        }
-      } catch (_) {}
-
-      // Fallback evaluate
-      const n2 = await slot.page.evaluate(() => {
-        const isDismissLabel = (raw) => {
-          const t = (raw || '').replace(/\s+/g, ' ').trim().toLowerCase();
-          return (
-            t === 'got it' || t === 'mengerti' || t === 'saya mengerti' ||
-            t === 'baik' || t === 'okay' || t === 'ok' ||
-            t === 'continue' || t === 'lanjutkan' || t === 'stay logged out' || t === '知道了'
-          );
-        };
-        let c = 0;
-        document.querySelectorAll('button, [role="button"]').forEach((b) => {
-          if (isDismissLabel(b.textContent || b.innerText)) {
-            try { b.click(); c++; } catch (e) {}
-          }
-        });
-        document.querySelectorAll('[role="dialog"], [data-state="open"]').forEach((d) => {
-          const text = d.innerText || '';
-          if (/more relevant|personalized replies|memori|memory|个性化/i.test(text)) {
-            const gotIt = Array.from(d.querySelectorAll('button')).find((b) => isDismissLabel(b.textContent));
-            const primary = gotIt || d.querySelector('button.btn-primary, button[class*="btn-primary"]');
-            if (primary) {
-              try { primary.click(); c++; } catch (e) {}
-            }
-          }
-        });
-        return c;
-      }).catch(() => 0);
-      n += n2;
-
-      if (n > 0) {
-        console.log(`[POOL] slot#${slot.id} keep-alive: klik popup x${n}`);
-      }
-    } catch (_) {
-      // page navigasi / transient — abaikan
-    }
+      await klikAreaKosong(slot.page);
+    } catch (_) {}
   };
-  slot._keepAliveTimer = setInterval(tick, 1000);
-  tick();
+  // jarang: jaga page hangat + tutup NUX tanpa deteksi
+  slot._keepAliveTimer = setInterval(tick, 8000);
 }
-
 function stopKeepAlivePopupGuard(slot) {
   if (slot && slot._keepAliveTimer) {
     clearInterval(slot._keepAliveTimer);
@@ -160,80 +102,73 @@ function stopKeepAlivePopupGuard(slot) {
   }
 }
 
-/** Deteksi profil — selaras chatgpt.js + soft btn+composer */
-async function tungguProfilSiap(page, timeoutMs) {
-  console.log('[POOL] 👤 Menunggu profil sidebar siap...');
-  const t0 = Date.now();
-  let ok = false;
-  let lastLog = 0;
-
-  while (Date.now() - t0 < timeoutMs) {
-    await page.evaluate(() => {
-      document.querySelectorAll('button').forEach((b) => {
-        const t = (b.textContent || '').trim().toLowerCase();
-        if (t === 'got it' || t === 'okay' || t === 'ok' || t === 'continue') {
-          try { b.click(); } catch (e) {}
-        }
-      });
-    }).catch(() => {});
-
-    const info = await page.evaluate(() => {
-      const btn = document.querySelector('[data-testid="accounts-profile-button"]');
-      const img = btn && (
-        btn.querySelector('img[alt="Profile image"]') ||
-        btn.querySelector('img[src*="auth0.com/avatars"]') ||
-        btn.querySelector('img[src^="http"]')
-      );
-      const src = img ? (img.getAttribute('src') || img.currentSrc || '') : '';
-      const aria = btn ? (btn.getAttribute('aria-label') || '') : '';
-      let sidebarName = '';
-      const upgradeBtn = Array.from(document.querySelectorAll('button, a, span')).find((el) =>
-        /^(Upgrade|Tingkatkan)$/i.test((el.textContent || '').trim())
-      );
-      if (upgradeBtn) {
-        let root = upgradeBtn.closest('div');
-        for (let i = 0; i < 6 && root; i++) {
-          const t = (root.innerText || '').replace(/\s+/g, ' ').trim();
-          if (/\b(Free|Plus|Pro|Team|Bebas)\b/i.test(t) && t.length < 80) {
-            sidebarName = t;
-            break;
-          }
-          root = root.parentElement;
-        }
+async function deteksiLoginAtauSignup(page) {
+  return page.evaluate(() => {
+    const texts = [];
+    document.querySelectorAll('button, a, [role="button"]').forEach((el) => {
+      const t = (el.innerText || el.textContent || el.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
+      if (t && t.length < 40) texts.push(t);
+    });
+    const body = (document.body && document.body.innerText) ? document.body.innerText.slice(0, 4000) : '';
+    for (const t of texts) {
+      if (/^(log\s*in|sign\s*up|create\s*account|masuk|daftar)$/i.test(t.trim())) {
+        return { hit: true, via: 'btn:' + t };
       }
-      const ariaHasName =
-        aria &&
-        !/^(open profile menu|buka menu profil)$/i.test(aria.trim()) &&
-        aria.trim().length > 5;
-      const composer = !!(
-        document.querySelector('#prompt-textarea') ||
-        document.querySelector('[data-testid="prompt-textarea"]') ||
-        document.querySelector('div.ProseMirror[contenteditable="true"]')
-      );
-      return {
-        hasBtn: !!btn,
-        hasImg: !!(src && src.startsWith('http')),
-        ariaHasName,
-        sidebarName: sidebarName.slice(0, 80),
-        composer,
-      };
-    }).catch(() => ({ hasBtn: false, hasImg: false, ariaHasName: false, sidebarName: '', composer: false }));
-
-    // Hanya profil via sidebar yang diterima (Free/Plus/Pro/Team/Bebas di dekat Upgrade)
-    if (info.sidebarName && /\b(Free|Plus|Pro|Team|Bebas)\b/i.test(info.sidebarName)) {
-      ok = true;
-      console.log(`[POOL] ✅ Profil via sidebar ${Date.now() - t0}ms`);
-      break;
     }
+    if (/log in or sign up/i.test(body)) return { hit: true, via: 'body-auth' };
+    if (document.querySelector('[data-testid="login-button"], [data-testid="signup-button"]')) {
+      return { hit: true, via: 'testid' };
+    }
+    return { hit: false, via: '' };
+  });
+}
 
+async function klikAreaKosong(page) {
+  try {
+    const vp = page.viewportSize() || { width: 1920, height: 1080 };
+    await page.mouse.click(Math.floor(vp.width * 0.92), Math.floor(vp.height * 0.5), { delay: 40 });
+    await page.waitForTimeout(120);
+    await page.mouse.click(Math.floor(vp.width * 0.5), Math.floor(vp.height * 0.92), { delay: 40 });
+    await page.waitForTimeout(150);
+  } catch (_) {}
+}
+
+/** Cookie invalid jika Login/Sign up. Timeout = COOKIE_INVALID (tidak dipaksa lanjut). */
+async function tungguSesiValid(page, timeoutMs) {
+  const limit = timeoutMs || SESI_TIMEOUT_MS;
+  console.log(`[POOL] 🔐 Cek sesi (max ${limit}ms; login/signup = invalid)...`);
+  const t0 = Date.now();
+  let lastLog = 0;
+  while (Date.now() - t0 < limit) {
+    const auth = await deteksiLoginAtauSignup(page);
+    if (auth.hit) throw new Error('COOKIE_INVALID: ' + auth.via);
+
+    const composer = await page.evaluate(() => {
+      const a = document.querySelector('#prompt-textarea');
+      if (a) {
+        const st = window.getComputedStyle(a);
+        if (st && st.display !== 'none' && st.visibility !== 'hidden') return true;
+      }
+      return !!(
+        document.querySelector('[data-testid="prompt-textarea"]') ||
+        document.querySelector('div.ProseMirror[contenteditable="true"]') ||
+        document.querySelector('[contenteditable="true"][aria-label="Ask ChatGPT"]')
+      );
+    }).catch(() => false);
+    if (composer) {
+      console.log(`[POOL] ✅ Sesi OK ${Date.now() - t0}ms`);
+      return;
+    }
     if (Date.now() - lastLog > 2500) {
       lastLog = Date.now();
-      console.log(`[POOL] profil… ${Date.now() - t0}ms hasBtn=${info.hasBtn} sidebar=${!!info.sidebarName} composer=${info.composer}`);
+      console.log(`[POOL] sesi… ${Date.now() - t0}ms`);
     }
-    await page.waitForTimeout(300);
+    await page.waitForTimeout(400);
   }
-
-  if (!ok) throw new Error('PROFIL_TIMEOUT');
+  const auth2 = await deteksiLoginAtauSignup(page);
+  if (auth2.hit) throw new Error('COOKIE_INVALID: ' + auth2.via);
+  // Jangan paksa lanjut — anggap cookie tidak aktif
+  throw new Error('COOKIE_INVALID: sesi timeout ' + limit + 'ms (composer tidak siap)');
 }
 
 async function tungguComposerSiap(page, timeoutMs) {
@@ -246,10 +181,127 @@ async function tungguComposerSiap(page, timeoutMs) {
     }
     return !!(
       document.querySelector('[data-testid="prompt-textarea"]') ||
-      document.querySelector('div.ProseMirror[contenteditable="true"]')
+      document.querySelector('div.ProseMirror[contenteditable="true"]') ||
+      document.querySelector('[contenteditable="true"][aria-label="Ask ChatGPT"]')
     );
   }, { timeout: timeoutMs });
   console.log('[POOL] ✅ Composer siap');
+}
+
+/** Disalin dari chatgpt.js — fokus nyata + insertText / keyboard */
+async function suntikPromptKeComposer(page, promptTeks) {
+  const clicked = await page.evaluate(() => {
+    const visible = (el) => {
+      if (!el) return false;
+      const st = window.getComputedStyle(el);
+      if (!st || st.display === 'none' || st.visibility === 'hidden') return false;
+      const r = el.getBoundingClientRect();
+      return r.width > 20 && r.height > 10;
+    };
+    const list = [];
+    const add = (el) => {
+      if (visible(el)) list.push(el);
+    };
+    add(document.querySelector('#prompt-textarea'));
+    add(document.querySelector('[data-testid="prompt-textarea"]'));
+    document.querySelectorAll('div.ProseMirror[contenteditable="true"], [contenteditable="true"]').forEach(add);
+    document.querySelectorAll('textarea').forEach(add);
+    if (!list.length) return null;
+    list.sort((a, b) => b.getBoundingClientRect().y - a.getBoundingClientRect().y);
+    const el = list[0];
+    const r = el.getBoundingClientRect();
+    return { x: r.x + r.width / 2, y: r.y + Math.min(r.height / 2, 24) };
+  });
+
+  if (clicked) {
+    await page.mouse.click(clicked.x, clicked.y, { delay: 30 });
+    await page.waitForTimeout(150);
+  }
+
+  const ok = await page.evaluate((teks) => {
+    const visible = (el) => {
+      if (!el) return false;
+      const st = window.getComputedStyle(el);
+      if (!st || st.display === 'none' || st.visibility === 'hidden') return false;
+      const r = el.getBoundingClientRect();
+      return r.width > 20 && r.height > 10;
+    };
+    const list = [];
+    const add = (el) => {
+      if (visible(el)) list.push(el);
+    };
+    add(document.querySelector('#prompt-textarea'));
+    add(document.querySelector('[data-testid="prompt-textarea"]'));
+    document.querySelectorAll('div.ProseMirror[contenteditable="true"], [contenteditable="true"]').forEach(add);
+    document.querySelectorAll('textarea').forEach(add);
+    if (!list.length) return false;
+    list.sort((a, b) => b.getBoundingClientRect().y - a.getBoundingClientRect().y);
+    const el = list[0];
+    el.focus();
+    try {
+      document.execCommand('selectAll', false, null);
+      document.execCommand('insertText', false, teks);
+    } catch (e) {
+      if (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT') {
+        el.value = teks;
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+      } else {
+        el.textContent = teks;
+        el.dispatchEvent(new InputEvent('input', { bubbles: true, data: teks }));
+      }
+    }
+    return (el.innerText || el.textContent || el.value || '').trim().length > 0;
+  }, promptTeks);
+
+  if (!ok) {
+    await page.keyboard.type(promptTeks, { delay: 8 });
+  }
+  return true;
+}
+
+/** Disalin dari chatgpt.js + marker UI baru (Stop / Working) */
+async function klikSendAtauEnter(page) {
+  const isGenerating = async () => {
+    return page.evaluate(() => {
+      return !!(
+        document.querySelector('button[aria-label="Stop"]') ||
+        document.querySelector('[role="status"][aria-label="Working"]') ||
+        document.querySelector('[data-testid="stop-button"]') ||
+        document.querySelector('.result-streaming')
+      );
+    }).catch(() => false);
+  };
+
+  // 1) Enter di composer (paling andal di UI lingkaran biru)
+  await page.keyboard.press('Enter');
+  await page.waitForTimeout(500);
+  if (await isGenerating()) return 'enter';
+
+  // 2) Klik send — berbagai selector
+  const locs = [
+    page.locator('[data-testid="send-button"]'),
+    page.getByRole('button', { name: /send prompt|kirim perintah|^send$|^kirim$/i }),
+    page.locator('button[aria-label*="Send" i]'),
+    page.locator('button[aria-label*="Kirim" i]'),
+    // Tombol bulat composer (sering tanpa teks) — primary di kanan composer
+    page.locator('form button.bg-composer-primary, button[class*="composer"][class*="rounded-full"]').last(),
+  ];
+  for (const loc of locs) {
+    try {
+      if (!(await loc.count())) continue;
+      const btn = loc.first();
+      if (!(await btn.isVisible().catch(() => false))) continue;
+      await btn.click({ timeout: 2500, force: true });
+      await page.waitForTimeout(400);
+      if (await isGenerating()) return 'click';
+    } catch (_) {}
+  }
+
+  // 3) Enter sekali lagi
+  await page.keyboard.press('Enter');
+  await page.waitForTimeout(400);
+  if (await isGenerating()) return 'enter-retry';
+  return 'enter-retry';
 }
 
 async function destroySlot(slot) {
@@ -296,7 +348,9 @@ async function bootSlotOnce(slot, folderHasil) {
     await page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
     await stepShot(page, folderHasil, '01_after_goto');
 
-    await tungguProfilSiap(page, PROFIL_TIMEOUT_MS);
+    await klikAreaKosong(page);
+    await tungguSesiValid(page, SESI_TIMEOUT_MS);
+    await klikAreaKosong(page);
     await stepShot(page, folderHasil, '02_after_profile');
 
     await tungguComposerSiap(page, 60000);
@@ -361,318 +415,42 @@ function slotPageAlive(slot) {
 }
 
 /**
- * Kerjakan tugas di PAGE YANG SUDAH READY — tanpa goto / tanpa cek profil ulang.
- * Logika tugas disalin ringkas dari chatgpt.js (thinking, gambar mode, upload, prompt, send, radar, download).
+ * Kerjakan tugas di PAGE YANG SUDAH READY.
+ * Langkah task (thinking / gambar / upload / suntik / send / radar / download)
+ * = IDENTIK chatgpt.js lewat eksekusiChatGPT(..., { page, holdPage: true }).
+ * Pool hanya mengatur: HOLD page, acquire, rebuild setelah selesai.
  */
 async function runTaskOnSlot(slot, { action, prompt, isThinkingMode, translatedFiles, folderHasil }) {
   if (!slot || slot.state !== 'busy') throw new Error('slot tidak busy');
   const page = slot.page;
   const context = slot.context;
   if (!page || !context) throw new Error('slot page/context hilang');
-
-  const tipeTugas = action || 'CHAT';
-  const promptTeks = prompt || '';
-  const validFiles = (translatedFiles || []).filter((f) => fs.existsSync(f));
-  let fileTersimpanArray = [];
+  if (!deps.chatgptModule || typeof deps.chatgptModule.eksekusiChatGPT !== 'function') {
+    throw new Error('pool deps.chatgptModule belum di-set');
+  }
 
   try {
-    // Pastikan masih di chatgpt + composer hidup
     const url = page.url();
     if (!/chatgpt\.com/i.test(url)) {
       throw new Error('page tidak di chatgpt.com — rebuild');
     }
 
-    // Bersihkan popup yang sempat muncul saat pending
-    await page.evaluate(() => {
-      document.querySelectorAll('button').forEach((b) => {
-        const t = (b.textContent || '').trim().toLowerCase();
-        if (t === 'got it' || t === 'okay' || t === 'ok' || t === 'continue') {
-          try { b.click(); } catch (e) {}
-        }
-      });
-    }).catch(() => {});
+    // Keep-alive off selama tugas (hindari klik di tengah send/radar)
+    stopKeepAlivePopupGuard(slot);
 
-    // Composer harus ada
-    await page.waitForSelector('#prompt-textarea, [data-testid="prompt-textarea"], div.ProseMirror[contenteditable="true"]', {
-      state: 'visible',
-      timeout: 15000,
-    });
-
-    if (isThinkingMode) {
-      console.log(`[POOL] 🧠 Thinking Mode...`);
-      await page.keyboard.press('Control+Shift+M');
-      await page.waitForTimeout(800);
-    }
-
-    if (tipeTugas === 'GAMBAR') {
-      console.log(`[POOL] 🎨 Mode Generasi Gambar...`);
-      try {
-        const plusBtnSelector = '[data-testid="composer-plus-btn"], #composer-plus-btn';
-        await page.waitForSelector(plusBtnSelector, { state: 'visible', timeout: 5000 });
-        const plusBox = await page.evaluate((sel) => {
-          const btn = document.querySelector(sel);
-          if (!btn) return null;
-          const rect = btn.getBoundingClientRect();
-          return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
-        }, plusBtnSelector);
-        if (plusBox) await page.mouse.click(plusBox.x, plusBox.y);
-        else await page.click(plusBtnSelector);
-        await page.waitForTimeout(1500);
-        const imgMenuBox = await page.evaluate(() => {
-          const spans = Array.from(document.querySelectorAll('span'));
-          const targetSpan = spans.find(
-            (s) =>
-              s.textContent.trim().toLowerCase() === 'buat gambar' ||
-              s.textContent.trim().toLowerCase() === 'create image'
-          );
-          if (!targetSpan) return null;
-          const clickableDiv =
-            targetSpan.closest('.__menu-item') ||
-            targetSpan.closest('div[tabindex="0"]') ||
-            targetSpan.parentElement;
-          const rect = clickableDiv.getBoundingClientRect();
-          return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
-        });
-        if (imgMenuBox) {
-          await page.mouse.move(imgMenuBox.x, imgMenuBox.y, { steps: 5 });
-          await page.waitForTimeout(200);
-          await page.mouse.click(imgMenuBox.x, imgMenuBox.y);
-        }
-        await page.waitForTimeout(800);
-      } catch (err) {
-        console.log(`[POOL] ⚠️ mode gambar: ${err.message}`);
-      }
-    }
-
-    // Upload (sama JURUS chatgpt.js)
-    if (validFiles.length > 0) {
-      const imageExtensions = ['.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.heic'];
-      const imageFiles = validFiles.filter((f) => imageExtensions.includes(path.extname(f).toLowerCase()));
-      const docFiles = validFiles.filter((f) => !imageExtensions.includes(path.extname(f).toLowerCase()));
-
-      if (docFiles.length > 0) {
-        console.log(`[POOL] 📄 Upload dokumen ${docFiles.length}...`);
-        try {
-          await page.locator('#composer-plus-btn, [data-testid="composer-plus-btn"]').click({ timeout: 3000 }).catch(() => {});
-          await page.waitForTimeout(400);
-          await page.evaluate(() => {
-            document.querySelectorAll('input[type="file"]').forEach((input) => {
-              input.removeAttribute('accept');
-              input.removeAttribute('capture');
-            });
-          });
-          const fileInputs = await page.locator('input[type="file"]').all();
-          for (const input of fileInputs) {
-            try {
-              await input.setInputFiles(docFiles, { force: true });
-            } catch (_) {}
-          }
-        } catch (e) {
-          console.log(`[POOL] ❌ doc: ${e.message}`);
-        }
-      }
-
-      if (imageFiles.length > 0) {
-        console.log(`[POOL] 🖼️ Upload gambar ${imageFiles.length}...`);
-        try {
-          await page.waitForSelector('input[type="file"]', { state: 'attached', timeout: 5000 }).catch(() => {});
-          const fileInputs = await page.locator('input[type="file"]').all();
-          for (const input of fileInputs) {
-            try {
-              await input.setInputFiles(imageFiles);
-              break;
-            } catch (_) {}
-          }
-        } catch (e) {
-          console.log(`[POOL] ❌ img: ${e.message}`);
-        }
-      }
-      await page.waitForTimeout(1500);
-    }
-
-    // Baseline
-    const { jumlahBubbleAwal, jumlahGambarAwal } = await page.evaluate(() => {
-      const genImages = Array.from(document.querySelectorAll('img[src*="backend-api/estuary"]')).filter((img) => {
-        if (img.closest('.group\\/message-image')) return false;
-        const altText = (img.getAttribute('alt') || '').toLowerCase();
-        return img.closest('.group\\/imagegen-image') || altText.includes('generated') || altText.includes('dibuat');
-      });
-      return {
-        jumlahBubbleAwal: document.querySelectorAll('[data-message-author-role="assistant"], .markdown.prose').length,
-        jumlahGambarAwal: genImages.length,
-      };
-    });
-
-    // Popup bisa muncul setelah profil READY — bersihkan lagi sebelum suntik
-    try {
-      const loc = page.locator(
-        'button:has-text("Got it"), button:has-text("Mengerti"), button:has-text("Okay"), [role="dialog"] button.btn-primary'
-      );
-      const count = await loc.count();
-      for (let i = 0; i < Math.min(count, 5); i++) {
-        const b = loc.nth(i);
-        if (await b.isVisible().catch(() => false)) await b.click({ timeout: 1500 }).catch(() => {});
-      }
-    } catch (_) {}
-
-    console.log(`[POOL] ⚡ Menyuntikkan Prompt...`);
-    const textarea = page.locator('#prompt-textarea');
-    await textarea.focus().catch(() => {});
-    await page.evaluate((teks) => {
-      const inputBox = document.querySelector('#prompt-textarea');
-      if (inputBox) document.execCommand('insertText', false, teks);
-    }, promptTeks);
-    await page.waitForTimeout(800);
-
-    console.log(`[POOL] ⏳ Menunggu tombol Send siap...`);
-    await page.waitForFunction(() => {
-      const sendBtn = document.querySelector('[data-testid="send-button"]');
-      if (!sendBtn) return false;
-      return !(sendBtn.disabled || sendBtn.hasAttribute('disabled') || sendBtn.getAttribute('aria-disabled') === 'true');
-    }, { timeout: 120000 }).catch(() => {});
-
-    console.log(`[POOL] 🚀 Mengirim tugas...`);
-    await page.evaluate(() => {
-      const sendBtn = document.querySelector('[data-testid="send-button"]');
-      if (sendBtn) sendBtn.click();
-    });
-    await stepShot(page, folderHasil, '08_after_send');
-
-    console.log('\n[POOL] ⏳ Radar (selesai = Mulai Suara / Start Voice, lalu ambil teks terlihat)...');
-    let hasilEktraksi = null;
-    const waktuMulai = Date.now();
-    while (Date.now() - waktuMulai < 300000) {
-      const state = await page.evaluate((args) => {
-        const { prompt, mode, gAwal } = args;
-        const bodyText = document.body.innerText || '';
-        const low = bodyText.toLowerCase();
-        if (low.includes("you've reached our limit") || low.includes('batas penggunaan')) {
-          return { status: 'error', msg: 'LIMIT_AKUN_TERCAPAI' };
-        }
-        const terlihat = (el) => {
-          if (!el || !el.isConnected || el.closest('[hidden]')) return false;
-          const r = el.getBoundingClientRect();
-          if (r.width < 4 || r.height < 4) return false;
-          const cs = window.getComputedStyle(el);
-          return cs.display !== 'none' && cs.visibility !== 'hidden';
-        };
-        const buttons = Array.from(document.querySelectorAll('button')).filter(terlihat);
-        const ariaOf = (b) => (b.getAttribute('aria-label') || '').trim();
-        const stop = buttons.find((b) => {
-          const a = ariaOf(b);
-          const t = b.getAttribute('data-testid') || '';
-          return t === 'stop-button' || a === 'Hentikan jawaban' || a === 'Stop';
-        });
-        const voice = buttons.find((b) => {
-          const a = ariaOf(b);
-          return a === 'Mulai Suara' || a === 'Start Voice';
-        });
-        if (stop) return { status: 'loading', via: 'stop', aria: ariaOf(stop) };
-        const getGenImages = () => Array.from(document.querySelectorAll('img[src*="backend-api/estuary"]')).filter((img) => {
-          if (img.closest('.group\\/message-image')) return false;
-          const alt = (img.getAttribute('alt') || '').toLowerCase();
-          return img.closest('.group\\/imagegen-image') || alt.includes('generated') || alt.includes('dibuat');
-        });
-        if (!voice) return { status: 'waiting', via: 'no-voice' };
-        const images = [...new Set(getGenImages().map((img) => img.src))];
-        if (mode === 'GAMBAR' && images.length > gAwal) {
-          let urls = images.slice(gAwal);
-          if (urls.length > 1) urls = [urls[0]];
-          return { status: 'done', images: urls, text: null, via: 'voice+gambar' };
-        }
-        let text = '';
-        const legacy = document.querySelectorAll('[data-message-author-role="assistant"]');
-        if (legacy.length) {
-          const last = legacy[legacy.length - 1];
-          const box = last.querySelector('.markdown.prose, .markdown') || last;
-          text = (box.innerText || '').trim();
-        }
-        if (!text) {
-          const main = document.querySelector('main') || document.body;
-          const lines = (main.innerText || '').split('\n').map((s) => s.trim()).filter(Boolean);
-          const p = (prompt || '').trim();
-          let idx = -1;
-          for (let i = lines.length - 1; i >= 0; i--) {
-            if (lines[i] === p) { idx = i; break; }
-          }
-          if (idx >= 0) {
-            const stopAt = ['Tanya ChatGPT', 'Ask ChatGPT', 'Message ChatGPT', 'ChatGPT bisa membuat kesalahan', 'ChatGPT can make mistakes'];
-            const out = [];
-            for (let i = idx + 1; i < lines.length; i++) {
-              if (stopAt.some((m) => lines[i].includes(m))) break;
-              out.push(lines[i]);
-            }
-            text = out.join('\n').trim();
-          }
-        }
-        if (mode === 'GAMBAR') {
-          if (text) return { status: 'done', text: `⚠️ Peringatan (Gambar gagal dibuat AI):\n${text}`, images: [], via: 'voice+teks' };
-          return { status: 'waiting', via: 'voice-no-image' };
-        }
-        if (text) return { status: 'done', text, images, via: 'voice+teks' };
-        return { status: 'waiting', via: 'voice-no-text' };
-      }, { prompt: promptTeks, mode: tipeTugas, gAwal: jumlahGambarAwal });
-
-      if (state.status === 'done') {
-        console.log(`[POOL] ✅ Radar done via=${state.via} len=${(state.text || '').length}`);
-        hasilEktraksi = state;
-        break;
-      }
-      if (state.status === 'error') throw new Error(state.msg);
-      if ((Date.now() - waktuMulai) % 8000 < 1600) {
-        console.log(`[POOL] radar wait via=${state.via || state.status}`);
-      }
-      await page.waitForTimeout(1200);
-    }
-
-    if (!hasilEktraksi) throw new Error('TIMEOUT: ChatGPT gagal memuat respon.');
-
-    // Download gambar jika ada
-    if (hasilEktraksi.images && hasilEktraksi.images.length > 0 && folderHasil) {
-      const https = require('https');
-      const http = require('http');
-      for (let i = 0; i < hasilEktraksi.images.length; i++) {
-        const imgUrl = hasilEktraksi.images[i];
-        const fileName = `chatgpt_IMG_${Date.now()}_${i + 1}.webp`;
-        const dest = path.join(folderHasil, fileName);
-        try {
-          const cookiesArray = await context.cookies();
-          const cookieStr = cookiesArray.map((c) => `${c.name}=${c.value}`).join('; ');
-          await new Promise((resolve, reject) => {
-            const lib = imgUrl.startsWith('https') ? https : http;
-            const req = lib.get(
-              imgUrl,
-              {
-                headers: {
-                  Cookie: cookieStr,
-                  'User-Agent': 'Mozilla/5.0',
-                  Referer: 'https://chatgpt.com/',
-                },
-              },
-              (res) => {
-                if (res.statusCode === 200 || res.statusCode === 206) {
-                  const file = fs.createWriteStream(dest);
-                  res.pipe(file);
-                  file.on('finish', () => {
-                    file.close();
-                    resolve(true);
-                  });
-                } else reject(new Error('HTTP ' + res.statusCode));
-              }
-            );
-            req.on('error', reject);
-            req.setTimeout(30000, () => {
-              req.destroy();
-              reject(new Error('Timeout'));
-            });
-          });
-          if (fs.existsSync(dest)) fileTersimpanArray.push(fileName);
-        } catch (_) {}
-      }
-    }
+    console.log(`[POOL] slot#${slot.id} → chatgpt.js eksekusi (page held)`);
+    const hasil = await deps.chatgptModule.eksekusiChatGPT(
+      action || 'CHAT',
+      prompt || '',
+      !!isThinkingMode,
+      translatedFiles || [],
+      folderHasil,
+      context,
+      { page, holdPage: true }
+    );
 
     return {
-      hasil: { text: hasilEktraksi.text, files: fileTersimpanArray },
+      hasil: { text: hasil && hasil.text, files: (hasil && hasil.files) || [] },
       cookieId: slot.cookieId,
     };
   } finally {
