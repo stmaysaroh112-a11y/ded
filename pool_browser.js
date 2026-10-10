@@ -120,11 +120,17 @@ function startKeepAlivePopupGuard(slot) {
       } catch (_) {}
 
       // Fallback evaluate
-      // Playwright: modal NUX spesifik
+      // Playwright: modal NUX (Mengerti / Got it) — focus + Enter (SS: ring biru = focused belum activate)
       try {
-        const nuxBtn = slot.page.locator('#modal-m3m-nux button.btn-primary, [data-testid="modal-m3m-nux"] button.btn-primary').filter({ hasText: /got it/i });
+        const nuxBtn = slot.page.locator(
+          '#modal-m3m-nux button.btn-primary, [data-testid="modal-m3m-nux"] button.btn-primary, [role="dialog"][data-state="open"] button.btn-primary'
+        ).filter({ hasText: /got it|mengerti/i });
         if (await nuxBtn.count() && await nuxBtn.first().isVisible().catch(() => false)) {
-          await nuxBtn.first().click({ timeout: 2500, force: true });
+          const b = nuxBtn.first();
+          await b.focus({ timeout: 1000 }).catch(() => {});
+          await slot.page.keyboard.press('Enter');
+          await slot.page.waitForTimeout(150);
+          await b.click({ timeout: 2000, force: true }).catch(() => {});
           n++;
         }
       } catch (_) {}
