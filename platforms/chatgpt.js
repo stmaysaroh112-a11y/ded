@@ -294,11 +294,21 @@ async function suntikPromptKeComposer(page, promptTeks) {
 }
 
 async function klikSendAtauEnter(page) {
+    const isGenerating = async () => {
+        return page.evaluate(() => {
+            return !!(
+                document.querySelector('button[aria-label="Stop"]') ||
+                document.querySelector('[role="status"][aria-label="Working"]') ||
+                document.querySelector('[data-testid="stop-button"]') ||
+                document.querySelector('.result-streaming')
+            );
+        }).catch(() => false);
+    };
+
     // 1) Enter di composer
     await page.keyboard.press('Enter');
     await page.waitForTimeout(500);
-    let gen = await page.locator('[data-testid="stop-button"], .result-streaming').count().catch(() => 0);
-    if (gen) return 'enter';
+    if (await isGenerating()) return 'enter';
 
     // 2) Klik send berbagai selector
     const locs = [
@@ -306,6 +316,7 @@ async function klikSendAtauEnter(page) {
         page.getByRole('button', { name: /send prompt|kirim perintah|^send$|^kirim$/i }),
         page.locator('button[aria-label*="Send" i]'),
         page.locator('button[aria-label*="Kirim" i]'),
+        page.locator('form button.bg-composer-primary, button[class*="rounded-full"][class*="composer"]').last(),
     ];
     for (const loc of locs) {
         try {
@@ -314,13 +325,14 @@ async function klikSendAtauEnter(page) {
             if (!(await btn.isVisible().catch(() => false))) continue;
             await btn.click({ timeout: 2500, force: true });
             await page.waitForTimeout(400);
-            gen = await page.locator('[data-testid="stop-button"], .result-streaming').count().catch(() => 0);
-            if (gen) return 'click';
+            if (await isGenerating()) return 'click';
         } catch (_) {}
     }
 
     // 3) Enter sekali lagi
     await page.keyboard.press('Enter');
+    await page.waitForTimeout(400);
+    if (await isGenerating()) return 'enter-retry';
     return 'enter-retry';
 }
 
@@ -331,91 +343,110 @@ async function klikSendAtauEnter(page) {
 // =====================================================================
 // 🚀 EKSEKUTOR UTAMA CHATGPT (HIBRIDA MURNI)
 // =====================================================================
-async function eksekusiChatGPT(tipeTugas, promptTeks, isThinkingMode, fileInputData, folderHasil, context) {
+/**
+ * @param {object} [options]
+ * @param {import('playwright').Page} [options.page] - page pool yang sudah READY (skip goto/sesi/composer boot)
+ * @param {boolean} [options.holdPage] - jangan tutup page di finally (default true jika options.page)
+ */
+async function eksekusiChatGPT(tipeTugas, promptTeks, isThinkingMode, fileInputData, folderHasil, context, options = {}) {
     let fileTersimpanArray = [];
     let arrayFile = Array.isArray(fileInputData) ? fileInputData : (fileInputData ? [fileInputData] : []);
     const validFiles = arrayFile.filter(f => fs.existsSync(f));
 
-    const page = await context.newPage();
-    await page.setViewportSize({ width: 1920, height: 1080 });
+    const existingPage = options && options.page ? options.page : null;
+    const holdPage = existingPage ? (options.holdPage !== false) : false;
+    let page = existingPage;
 
-    // 🌟 SISTEM PEMBUNUH POP-UP OTONOM (selalu nyala, termasuk memory NUX)
-    await page.addInitScript(() => {
-        const dismissPopups = () => {
-            const btns = document.querySelectorAll('button');
-            for (const btn of btns) {
-                const txt = (btn.textContent || '').trim().toLowerCase();
-                if (
-                    txt === 'got it' ||
-                    txt === '知道了' ||
-                    txt === 'okay' ||
-                    txt === 'ok' ||
-                    txt === 'stay logged out' ||
-                    txt === 'continue'
-                ) {
-                    try { btn.click(); } catch (e) {}
-                }
-                if (
-                    btn.querySelector('svg') &&
-                    (btn.getAttribute('aria-label') === 'Close' || btn.getAttribute('aria-label') === 'Tutup')
-                ) {
-                    try { btn.click(); } catch (e) {}
-                }
-            }
+    if (!page) {
+        page = await context.newPage();
+        await page.setViewportSize({ width: 1920, height: 1080 });
 
-            // Dialog radix / memory NUX: "More relevant, personalized replies"
-            document.querySelectorAll('[role="dialog"]').forEach((d) => {
-                const t = d.innerText || '';
-                if (
-                    t.includes('More relevant') ||
-                    t.includes('personalized replies') ||
-                    t.includes('个性化') ||
-                    t.includes('already uploaded')
-                ) {
-                    const gotIt = Array.from(d.querySelectorAll('button')).find((b) =>
-                        /^\s*got it\s*$/i.test((b.textContent || '').trim())
-                    );
-                    if (gotIt) {
-                        try { gotIt.click(); } catch (e) {}
-                    } else {
-                        try { d.remove(); } catch (e) {}
+        // 🌟 SISTEM PEMBUNUH POP-UP OTONOM (selalu nyala, termasuk memory NUX)
+        await page.addInitScript(() => {
+            const dismissPopups = () => {
+                const btns = document.querySelectorAll('button');
+                for (const btn of btns) {
+                    const txt = (btn.textContent || '').trim().toLowerCase();
+                    if (
+                        txt === 'got it' ||
+                        txt === '知道了' ||
+                        txt === 'okay' ||
+                        txt === 'ok' ||
+                        txt === 'stay logged out' ||
+                        txt === 'continue'
+                    ) {
+                        try { btn.click(); } catch (e) {}
+                    }
+                    if (
+                        btn.querySelector('svg') &&
+                        (btn.getAttribute('aria-label') === 'Close' || btn.getAttribute('aria-label') === 'Tutup')
+                    ) {
+                        try { btn.click(); } catch (e) {}
                     }
                 }
-            });
-        };
 
-        const observer = new MutationObserver(() => dismissPopups());
-        observer.observe(document.documentElement, { childList: true, subtree: true });
-        setInterval(dismissPopups, 800);
-        dismissPopups();
-    });
+                document.querySelectorAll('[role="dialog"]').forEach((d) => {
+                    const t = d.innerText || '';
+                    if (
+                        t.includes('More relevant') ||
+                        t.includes('personalized replies') ||
+                        t.includes('个性化') ||
+                        t.includes('already uploaded')
+                    ) {
+                        const gotIt = Array.from(d.querySelectorAll('button')).find((b) =>
+                            /^\s*got it\s*$/i.test((b.textContent || '').trim())
+                        );
+                        if (gotIt) {
+                            try { gotIt.click(); } catch (e) {}
+                        } else {
+                            try { d.remove(); } catch (e) {}
+                        }
+                    }
+                });
+            };
+
+            const observer = new MutationObserver(() => dismissPopups());
+            observer.observe(document.documentElement, { childList: true, subtree: true });
+            setInterval(dismissPopups, 800);
+            dismissPopups();
+        });
+    }
 
     try {
-        // ---------------------------------------------------------
-        // 1) Navigasi
-        // ---------------------------------------------------------
-        console.log(`\n[CHATGPT] 🌐 Membuka ChatGPT...`);
-        await page.goto('https://chatgpt.com/', { waitUntil: 'domcontentloaded', timeout: 90000 }).catch(()=>{});
-        await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
-        await stepShot(page, folderHasil, '01_after_goto');
+        if (!existingPage) {
+            // ---------------------------------------------------------
+            // 1) Navigasi (cold start only)
+            // ---------------------------------------------------------
+            console.log(`\n[CHATGPT] 🌐 Membuka ChatGPT...`);
+            await page.goto('https://chatgpt.com/', { waitUntil: 'domcontentloaded', timeout: 90000 }).catch(()=>{});
+            await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
+            await stepShot(page, folderHasil, '01_after_goto');
 
-        // Klik nyata di area kosong — tutup NUX/overlay tanpa deteksi
-        await klikAreaKosong(page);
+            await klikAreaKosong(page);
 
-        // ---------------------------------------------------------
-        // 2) Validasi cookie: Login/Sign up = invalid
-        // ---------------------------------------------------------
-        await tungguSesiValid(page, 45000);
-        await stepShot(page, folderHasil, '02_after_session');
-        await klikAreaKosong(page);
+            // ---------------------------------------------------------
+            // 2) Validasi cookie: Login/Sign up = invalid
+            // ---------------------------------------------------------
+            await tungguSesiValid(page, 45000);
+            await stepShot(page, folderHasil, '02_after_session');
+            await klikAreaKosong(page);
 
-        // ---------------------------------------------------------
-        // 3) Composer siap → baru ketik prompt
-        // ---------------------------------------------------------
-        await tungguComposerSiap(page, 60000);
-        await stepShot(page, folderHasil, '03_composer_ready');
-        await klikAreaKosong(page);
-        await page.waitForTimeout(400);
+            // ---------------------------------------------------------
+            // 3) Composer siap → baru ketik prompt
+            // ---------------------------------------------------------
+            await tungguComposerSiap(page, 60000);
+            await stepShot(page, folderHasil, '03_composer_ready');
+            await klikAreaKosong(page);
+            await page.waitForTimeout(400);
+        } else {
+            // Pool path: page sudah di chatgpt + sesi + composer (HOLD)
+            console.log(`\n[CHATGPT] ⚡ Lanjut di page pool (skip goto/sesi)...`);
+            await klikAreaKosong(page);
+            // Soft ensure composer masih ada (singkat)
+            await tungguComposerSiap(page, 15000);
+            await klikAreaKosong(page);
+            await page.waitForTimeout(200);
+        }
 
         if (isThinkingMode) {
             console.log(`[CHATGPT] 🧠 Mengaktifkan Thinking Mode...`);
@@ -898,7 +929,9 @@ async function eksekusiChatGPT(tipeTugas, promptTeks, isThinkingMode, fileInputD
         } catch (screenshotErr) {}
         throw err;
     } finally {
-        await page.close().catch(()=>{});
+        if (!holdPage && page) {
+            await page.close().catch(()=>{});
+        }
     }
 }
 
