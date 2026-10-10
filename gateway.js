@@ -1,638 +1,604 @@
-/**
- * pool_browser.js
- * - Boot slot: langkah sama seperti chatgpt.js (goto → stepShot → profil → composer) lalu HOLD page
- * - Saat tugas: JANGAN goto ulang. Pakai page yang sudah READY → suntik prompt / mode / upload → radar
- */
-const path = require('path');
+const express = require('express');
+const cors = require('cors');
 const fs = require('fs');
-
-const POOL_SIZE = parseInt(process.env.POOL_SIZE || '5', 10);
-const PROFIL_TIMEOUT_MS = parseInt(process.env.POOL_PROFIL_TIMEOUT_MS || '90000', 10);
-const REBUILD_DELAY_MS = parseInt(process.env.POOL_REBUILD_DELAY_MS || '5000', 10);
-const BOOT_GAP_MS = parseInt(process.env.POOL_BOOT_GAP_MS || '4000', 10);
-
-let deps = {
-  launchGatewayBrowser: null,
-  dapatkanSesiCookie: null,
-  chatgptModule: null,
-};
-
-const slots = [];
-let started = false;
-
-function setDeps(d) {
-  deps = { ...deps, ...d };
+const path = require('path');
+const { spawn, exec } = require('child_process');
+const { launchCamoufox } = require('./camoufox_launch');
+const { Redis } = require('@upstash/redis');
+require('dotenv').config({ path: path.join(__dirname, '.env') });
+const chatgptModule = require('./platforms/chatgpt');
+let poolBrowser = null;
+try { poolBrowser = require('./pool_browser'); } catch (e) {
+    console.log('[POOL] modul tidak ada — cold start only:', e.message);
 }
 
-async function stepShot(page, folderHasil, label) {
-  try {
-    if (!folderHasil || !page) return;
-    const safe = String(label || 'step').replace(/[^a-zA-Z0-9_-]+/g, '_').slice(0, 60);
-    const fp = path.join(folderHasil, `pool_${Date.now()}_${safe}.png`);
-    await page.screenshot({ path: fp, fullPage: false }).catch(() => {});
-    console.log(`[POOL] 📸 ${label} → ${path.basename(fp)}`);
-  } catch (_) {}
-}
+const xvfb = spawn('Xvfb', [':99', '-screen', '0', '1280x800x24']);
+process.env.DISPLAY = ':99';
 
-async function installPopupKiller(page) {
-  await page.addInitScript(() => {
-    const dismissPopups = () => {
-      const btns = document.querySelectorAll('button');
-      for (const btn of btns) {
-        const txt = (btn.textContent || '').trim().toLowerCase();
-        if (
-          txt === 'got it' ||
-          txt === '知道了' ||
-          txt === 'okay' ||
-          txt === 'ok' ||
-          txt === 'stay logged out' ||
-          txt === 'continue'
-        ) {
-          try { btn.click(); } catch (e) {}
-        }
-      }
-      document.querySelectorAll('[role="dialog"]').forEach((d) => {
-        const t = d.innerText || '';
-        if (
-          t.includes('More relevant') ||
-          t.includes('personalized replies') ||
-          t.includes('个性化') ||
-          t.includes('already uploaded')
-        ) {
-          const gotIt = Array.from(d.querySelectorAll('button')).find((b) =>
-            /^\s*got it\s*$/i.test((b.textContent || '').trim())
-          );
-          if (gotIt) {
-            try { gotIt.click(); } catch (e) {}
-          } else {
-            try { d.remove(); } catch (e) {}
-          }
-        }
-      });
-    };
-    if (!window.__poolPopupKillerInstalled) {
-      window.__poolPopupKillerInstalled = true;
-      const observer = new MutationObserver(() => dismissPopups());
-      observer.observe(document.documentElement, { childList: true, subtree: true });
-      setInterval(dismissPopups, 800);
-    }
-    dismissPopups();
-  });
-}
+const PROXY_HOST = process.env.PROXY_HOST || '';
+const PROXY_PORT = parseInt(process.env.PROXY_PORT || '0', 10);
+const PROXY_VERSION = parseInt(process.env.PROXY_VERSION || '5', 10);
 
-/** Node-side: tetap klik Got it selama slot READY (pending tunggu tugas) */
-function startKeepAlivePopupGuard(slot) {
-  stopKeepAlivePopupGuard(slot);
-  const tick = async () => {
-    if (slot.state !== 'ready' || !slot.page) return;
-    try {
-      if (typeof slot.page.isClosed === 'function' && slot.page.isClosed()) return;
-      await klikAreaKosong(slot.page);
-    } catch (_) {}
-  };
-  // jarang: jaga page hangat + tutup NUX tanpa deteksi
-  slot._keepAliveTimer = setInterval(tick, 8000);
-}
-function stopKeepAlivePopupGuard(slot) {
-  if (slot && slot._keepAliveTimer) {
-    clearInterval(slot._keepAliveTimer);
-    slot._keepAliveTimer = null;
-  }
-}
+// Layer 2: Bright Data ISP (HTTP + auth) — setelah localtonet gagal
+const BD_PROXY_HOST = process.env.BD_PROXY_HOST || process.env.BRIGHTDATA_HOST || '';
+const BD_PROXY_PORT = parseInt(process.env.BD_PROXY_PORT || process.env.BRIGHTDATA_PORT || '0', 10);
+const BD_PROXY_USER = process.env.BD_PROXY_USER || process.env.BRIGHTDATA_USER || '';
+const BD_PROXY_PASS = process.env.BD_PROXY_PASS || process.env.BRIGHTDATA_PASS || '';
 
-async function deteksiLoginAtauSignup(page) {
-  return page.evaluate(() => {
-    const texts = [];
-    document.querySelectorAll('button, a, [role="button"]').forEach((el) => {
-      const t = (el.innerText || el.textContent || el.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
-      if (t && t.length < 40) texts.push(t);
-    });
-    const body = (document.body && document.body.innerText) ? document.body.innerText.slice(0, 4000) : '';
-    for (const t of texts) {
-      if (/^(log\s*in|sign\s*up|create\s*account|masuk|daftar)$/i.test(t.trim())) {
-        return { hit: true, via: 'btn:' + t };
-      }
-    }
-    if (/log in or sign up/i.test(body)) return { hit: true, via: 'body-auth' };
-    if (document.querySelector('[data-testid="login-button"], [data-testid="signup-button"]')) {
-      return { hit: true, via: 'testid' };
-    }
-    return { hit: false, via: '' };
-  });
-}
+// Layer 3 (opsional): Webshare / static HTTP — jika Bright Data juga gagal
+const STATIC_PROXY_HOST = process.env.STATIC_PROXY_HOST || '';
+const STATIC_PROXY_PORT = parseInt(process.env.STATIC_PROXY_PORT || '0', 10);
+const STATIC_PROXY_USER = process.env.STATIC_PROXY_USER || '';
+const STATIC_PROXY_PASS = process.env.STATIC_PROXY_PASS || '';
 
-async function klikAreaKosong(page) {
-  try {
-    const vp = page.viewportSize() || { width: 1920, height: 1080 };
-    await page.mouse.click(Math.floor(vp.width * 0.92), Math.floor(vp.height * 0.5), { delay: 40 });
-    await page.waitForTimeout(120);
-    await page.mouse.click(Math.floor(vp.width * 0.5), Math.floor(vp.height * 0.92), { delay: 40 });
-    await page.waitForTimeout(150);
-  } catch (_) {}
-}
+const redis = new Redis({
+  url: process.env.UPSTASH_REDIS_REST_URL,
+  token: process.env.UPSTASH_REDIS_REST_TOKEN,
+});
 
-/** Cookie invalid jika Login/Sign up; valid jika composer ada tanpa auth wall */
-async function tungguSesiValid(page, timeoutMs) {
-  console.log('[POOL] 🔐 Cek sesi (login/signup = invalid)...');
-  const t0 = Date.now();
-  let lastLog = 0;
-  while (Date.now() - t0 < timeoutMs) {
-    const auth = await deteksiLoginAtauSignup(page);
-    if (auth.hit) throw new Error('COOKIE_INVALID: ' + auth.via);
+const { startDeadman } = require('./qstash_deadman');
 
-    const composer = await page.evaluate(() => {
-      const a = document.querySelector('#prompt-textarea');
-      if (a) {
-        const st = window.getComputedStyle(a);
-        if (st && st.display !== 'none' && st.visibility !== 'hidden') return true;
-      }
-      return !!(
-        document.querySelector('[data-testid="prompt-textarea"]') ||
-        document.querySelector('div.ProseMirror[contenteditable="true"]')
-      );
-    }).catch(() => false);
-    if (composer) {
-      console.log(`[POOL] ✅ Sesi OK ${Date.now() - t0}ms`);
-      return;
-    }
-    if (Date.now() - lastLog > 2500) {
-      lastLog = Date.now();
-      console.log(`[POOL] sesi… ${Date.now() - t0}ms`);
-    }
-    await page.waitForTimeout(400);
-  }
-  const auth2 = await deteksiLoginAtauSignup(page);
-  if (auth2.hit) throw new Error('COOKIE_INVALID: ' + auth2.via);
-  console.log('[POOL] ⚠️ timeout sesi tanpa auth wall — lanjut');
-}
-
-async function tungguComposerSiap(page, timeoutMs) {
-  console.log('[POOL] ⏳ Menunggu kolom teks (composer) siap...');
-  await page.waitForFunction(() => {
-    const a = document.querySelector('#prompt-textarea');
-    if (a) {
-      const st = window.getComputedStyle(a);
-      if (st && st.display !== 'none' && st.visibility !== 'hidden') return true;
-    }
-    return !!(
-      document.querySelector('[data-testid="prompt-textarea"]') ||
-      document.querySelector('div.ProseMirror[contenteditable="true"]')
-    );
-  }, { timeout: timeoutMs });
-  console.log('[POOL] ✅ Composer siap');
-}
-
-async function destroySlot(slot) {
-  stopKeepAlivePopupGuard(slot);
-  const { page, context, browser } = slot;
-  slot.page = null;
-  slot.context = null;
-  slot.browser = null;
-  slot.cookieId = null;
-  slot.readyAt = null;
-  slot.state = 'dead';
-  try { if (page) await page.close().catch(() => {}); } catch (_) {}
-  try { if (context) await context.close().catch(() => {}); } catch (_) {}
-  try { if (browser) await browser.close().catch(() => {}); } catch (_) {}
-}
-
-/**
- * Boot sampai profil+composer — page TETAP HIDUP (HOLD).
- * folderHasil untuk stepShot (opsional).
- */
-async function bootSlotOnce(slot, folderHasil) {
-  if (!deps.launchGatewayBrowser || !deps.dapatkanSesiCookie) {
-    throw new Error('pool deps belum di-set');
-  }
-
-  slot.state = 'booting';
-  console.log(`[POOL] slot#${slot.id} booting (cara gateway)...`);
-  await destroySlot(slot);
-
-  const sesi = await deps.dapatkanSesiCookie();
-  console.log(`[POOL] slot#${slot.id} cookie=${sesi.id}`);
-
-  const launched = await deps.launchGatewayBrowser();
-  const browser = launched.browser;
-  const context = await browser.newContext({ acceptDownloads: true });
-  await context.addCookies(sesi.cookies);
-  const page = await context.newPage();
-  await page.setViewportSize({ width: 1920, height: 1080 });
-  await installPopupKiller(page);
-
-  try {
-    console.log(`\n[POOL] 🌐 Membuka ChatGPT...`);
-    await page.goto('https://chatgpt.com/', { waitUntil: 'domcontentloaded', timeout: 90000 }).catch(() => {});
-    await page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
-    await stepShot(page, folderHasil, '01_after_goto');
-
-    await klikAreaKosong(page);
-    await tungguSesiValid(page, PROFIL_TIMEOUT_MS);
-    await klikAreaKosong(page);
-    await stepShot(page, folderHasil, '02_after_profile');
-
-    await tungguComposerSiap(page, 60000);
-    await stepShot(page, folderHasil, '03_composer_ready');
-    await page.waitForTimeout(500);
-  } catch (e) {
-    try { await page.close().catch(() => {}); } catch (_) {}
-    try { await context.close().catch(() => {}); } catch (_) {}
-    try { await browser.close().catch(() => {}); } catch (_) {}
-    throw e;
-  }
-
-  slot.browser = browser;
-  slot.context = context;
-  slot.page = page; // HOLD — jangan ditutup
-  slot.cookieId = sesi.id;
-  slot.readyAt = Date.now();
-  slot.state = 'ready';
-  startKeepAlivePopupGuard(slot);
-  console.log(`[POOL] slot#${slot.id} READY cookie=${sesi.id} net=${launched.label} (page held, popup guard on)`);
-}
-
-async function bootSlotLoop(slot, folderHasil) {
-  for (;;) {
-    if (slot.state === 'busy') return;
-    try {
-      await bootSlotOnce(slot, folderHasil);
-      return;
-    } catch (e) {
-      console.log(`[POOL] slot#${slot.id} boot gagal (${e.message}) — cookie lain dalam ${REBUILD_DELAY_MS}ms`);
-      await destroySlot(slot);
-      await new Promise((r) => setTimeout(r, REBUILD_DELAY_MS));
-    }
-  }
-}
-
-async function bootAllSequential(folderHasil) {
-  for (const slot of slots) {
-    if (slot.state === 'ready' || slot.state === 'busy') continue;
-    await bootSlotLoop(slot, folderHasil);
-    await new Promise((r) => setTimeout(r, BOOT_GAP_MS));
-  }
-  console.log(`[POOL] boot batch selesai:`, poolStats());
-}
-
-function acquireReadySlot() {
-  const slot = slots.find((s) => s.state === 'ready' && slotPageAlive(s));
-  if (!slot) return null;
-  stopKeepAlivePopupGuard(slot);
-  slot.state = 'busy';
-  return slot;
-}
-
-function slotPageAlive(slot) {
-  try {
-    if (!slot.page || !slot.context || !slot.browser) return false;
-    if (typeof slot.page.isClosed === 'function' && slot.page.isClosed()) return false;
-    return true;
-  } catch (_) {
-    return false;
-  }
-}
-
-/**
- * Kerjakan tugas di PAGE YANG SUDAH READY — tanpa goto / tanpa cek profil ulang.
- * Logika tugas disalin ringkas dari chatgpt.js (thinking, gambar mode, upload, prompt, send, radar, download).
- */
-async function runTaskOnSlot(slot, { action, prompt, isThinkingMode, translatedFiles, folderHasil }) {
-  if (!slot || slot.state !== 'busy') throw new Error('slot tidak busy');
-  const page = slot.page;
-  const context = slot.context;
-  if (!page || !context) throw new Error('slot page/context hilang');
-
-  const tipeTugas = action || 'CHAT';
-  const promptTeks = prompt || '';
-  const validFiles = (translatedFiles || []).filter((f) => fs.existsSync(f));
-  let fileTersimpanArray = [];
-
-  try {
-    // Pastikan masih di chatgpt + composer hidup
-    const url = page.url();
-    if (!/chatgpt\.com/i.test(url)) {
-      throw new Error('page tidak di chatgpt.com — rebuild');
-    }
-
-    // Bersihkan popup yang sempat muncul saat pending
-    await page.evaluate(() => {
-      document.querySelectorAll('button').forEach((b) => {
-        const t = (b.textContent || '').trim().toLowerCase();
-        if (t === 'got it' || t === 'okay' || t === 'ok' || t === 'continue') {
-          try { b.click(); } catch (e) {}
-        }
-      });
-    }).catch(() => {});
-
-    // Composer harus ada
-    await page.waitForSelector('#prompt-textarea, [data-testid="prompt-textarea"], div.ProseMirror[contenteditable="true"]', {
-      state: 'visible',
-      timeout: 15000,
-    });
-
-    if (isThinkingMode) {
-      console.log(`[POOL] 🧠 Thinking Mode...`);
-      await page.keyboard.press('Control+Shift+M');
-      await page.waitForTimeout(800);
-    }
-
-    if (tipeTugas === 'GAMBAR') {
-      console.log(`[POOL] 🎨 Mode Generasi Gambar...`);
-      try {
-        const plusBtnSelector = '[data-testid="composer-plus-btn"], #composer-plus-btn';
-        await page.waitForSelector(plusBtnSelector, { state: 'visible', timeout: 5000 });
-        const plusBox = await page.evaluate((sel) => {
-          const btn = document.querySelector(sel);
-          if (!btn) return null;
-          const rect = btn.getBoundingClientRect();
-          return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
-        }, plusBtnSelector);
-        if (plusBox) await page.mouse.click(plusBox.x, plusBox.y);
-        else await page.click(plusBtnSelector);
-        await page.waitForTimeout(1500);
-        const imgMenuBox = await page.evaluate(() => {
-          const spans = Array.from(document.querySelectorAll('span'));
-          const targetSpan = spans.find(
-            (s) =>
-              s.textContent.trim().toLowerCase() === 'buat gambar' ||
-              s.textContent.trim().toLowerCase() === 'create image'
-          );
-          if (!targetSpan) return null;
-          const clickableDiv =
-            targetSpan.closest('.__menu-item') ||
-            targetSpan.closest('div[tabindex="0"]') ||
-            targetSpan.parentElement;
-          const rect = clickableDiv.getBoundingClientRect();
-          return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
-        });
-        if (imgMenuBox) {
-          await page.mouse.move(imgMenuBox.x, imgMenuBox.y, { steps: 5 });
-          await page.waitForTimeout(200);
-          await page.mouse.click(imgMenuBox.x, imgMenuBox.y);
-        }
-        await page.waitForTimeout(800);
-      } catch (err) {
-        console.log(`[POOL] ⚠️ mode gambar: ${err.message}`);
-      }
-    }
-
-    // Upload (sama JURUS chatgpt.js)
-    if (validFiles.length > 0) {
-      const imageExtensions = ['.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.heic'];
-      const imageFiles = validFiles.filter((f) => imageExtensions.includes(path.extname(f).toLowerCase()));
-      const docFiles = validFiles.filter((f) => !imageExtensions.includes(path.extname(f).toLowerCase()));
-
-      if (docFiles.length > 0) {
-        console.log(`[POOL] 📄 Upload dokumen ${docFiles.length}...`);
-        try {
-          await page.locator('#composer-plus-btn, [data-testid="composer-plus-btn"]').click({ timeout: 3000 }).catch(() => {});
-          await page.waitForTimeout(400);
-          await page.evaluate(() => {
-            document.querySelectorAll('input[type="file"]').forEach((input) => {
-              input.removeAttribute('accept');
-              input.removeAttribute('capture');
-            });
-          });
-          const fileInputs = await page.locator('input[type="file"]').all();
-          for (const input of fileInputs) {
-            try {
-              await input.setInputFiles(docFiles, { force: true });
-            } catch (_) {}
-          }
-        } catch (e) {
-          console.log(`[POOL] ❌ doc: ${e.message}`);
-        }
-      }
-
-      if (imageFiles.length > 0) {
-        console.log(`[POOL] 🖼️ Upload gambar ${imageFiles.length}...`);
-        try {
-          await page.waitForSelector('input[type="file"]', { state: 'attached', timeout: 5000 }).catch(() => {});
-          const fileInputs = await page.locator('input[type="file"]').all();
-          for (const input of fileInputs) {
-            try {
-              await input.setInputFiles(imageFiles);
-              break;
-            } catch (_) {}
-          }
-        } catch (e) {
-          console.log(`[POOL] ❌ img: ${e.message}`);
-        }
-      }
-      await page.waitForTimeout(1500);
-    }
-
-    // Baseline
-    const { jumlahBubbleAwal, jumlahGambarAwal } = await page.evaluate(() => {
-      const genImages = Array.from(document.querySelectorAll('img[src*="backend-api/estuary"]')).filter((img) => {
-        if (img.closest('.group\\/message-image')) return false;
-        const altText = (img.getAttribute('alt') || '').toLowerCase();
-        return img.closest('.group\\/imagegen-image') || altText.includes('generated') || altText.includes('dibuat');
-      });
-      return {
-        jumlahBubbleAwal: document.querySelectorAll('[data-message-author-role="assistant"], .markdown.prose').length,
-        jumlahGambarAwal: genImages.length,
-      };
-    });
-
-    await klikAreaKosong(page);
-    console.log(`[POOL] ⚡ Menyuntikkan Prompt...`);
-    const textarea = page.locator('#prompt-textarea');
-    await textarea.focus().catch(() => {});
-    await page.evaluate((teks) => {
-      const inputBox = document.querySelector('#prompt-textarea');
-      if (inputBox) document.execCommand('insertText', false, teks);
-    }, promptTeks);
-    await page.waitForTimeout(800);
-
-    console.log(`[POOL] ⏳ Menunggu tombol Send siap...`);
-    await page.waitForFunction(() => {
-      const sendBtn = document.querySelector('[data-testid="send-button"]');
-      if (!sendBtn) return false;
-      return !(sendBtn.disabled || sendBtn.hasAttribute('disabled') || sendBtn.getAttribute('aria-disabled') === 'true');
-    }, { timeout: 120000 }).catch(() => {});
-
-    console.log(`[POOL] 🚀 Mengirim tugas...`);
-    await page.evaluate(() => {
-      const sendBtn = document.querySelector('[data-testid="send-button"]');
-      if (sendBtn) sendBtn.click();
-    });
-    await stepShot(page, folderHasil, '08_after_send');
-
-    // Radar (subset chatgpt.js)
-    console.log('\n[POOL] ⏳ Radar DOM...');
-    let hasilEktraksi = null;
-    const waktuMulai = Date.now();
-    while (Date.now() - waktuMulai < 300000) {
-      const state = await page.evaluate((args) => {
-        const { bAwal, gAwal, mode } = args;
-        if (
-          document.body.innerText.toLowerCase().includes("you've reached our limit") ||
-          document.body.innerText.toLowerCase().includes('batas penggunaan')
-        ) {
-          return { status: 'error', msg: 'LIMIT_AKUN_TERCAPAI' };
-        }
-        if (document.querySelector('[data-testid="stop-button"]') || document.querySelector('.result-streaming')) {
-          return { status: 'loading' };
-        }
-        const getGenImages = () =>
-          Array.from(document.querySelectorAll('img[src*="backend-api/estuary"]')).filter((img) => {
-            if (img.closest('.group\\/message-image')) return false;
-            return (
-              img.closest('.group\\/imagegen-image') ||
-              (img.getAttribute('alt') || '').toLowerCase().includes('generated') ||
-              (img.getAttribute('alt') || '').toLowerCase().includes('dibuat')
-            );
-          });
-
-        if (mode === 'GAMBAR') {
-          const allGenImages = getGenImages();
-          if (allGenImages.length > gAwal) {
-            const newestImage = allGenImages[allGenImages.length - 1];
-            const container =
-              newestImage.closest('.group\\/imagegen-image') ||
-              newestImage.parentElement.parentElement.parentElement;
-            const actionButtons = container ? container.querySelectorAll('button') : [];
-            if (actionButtons.length >= 2) {
-              let uniqueImageUrls = [...new Set(allGenImages.slice(gAwal).map((img) => img.src))];
-              if (uniqueImageUrls.length > 1) uniqueImageUrls = [uniqueImageUrls[0]];
-              return { status: 'done', images: uniqueImageUrls, text: null };
-            }
-          }
-        } else {
-          const messages = Array.from(
-            document.querySelectorAll('[data-message-author-role="assistant"], .markdown.prose')
-          );
-          if (messages.length > bAwal) {
-            const lastMessage = messages[messages.length - 1];
-            const parentBlock =
-              lastMessage.closest('[data-testid^="conversation-turn"]') ||
-              lastMessage.parentElement.parentElement;
-            const actionButtons = parentBlock ? parentBlock.querySelectorAll('button') : [];
-            if (actionButtons.length >= 2 && !document.querySelector('.result-streaming')) {
-              const textContainer = lastMessage.querySelector('.markdown.prose') || lastMessage;
-              const finalTxt = textContainer.innerText.trim();
-              return { status: 'done', text: finalTxt, images: [] };
-            }
-          }
-        }
-        return { status: 'waiting' };
-      }, { bAwal: jumlahBubbleAwal, gAwal: jumlahGambarAwal, mode: tipeTugas });
-
-      if (state.status === 'done') {
-        hasilEktraksi = state;
-        break;
-      }
-      if (state.status === 'error') throw new Error(state.msg);
-      await page.waitForTimeout(2000);
-    }
-
-    if (!hasilEktraksi) throw new Error('TIMEOUT: ChatGPT gagal memuat respon.');
-
-    // Download gambar jika ada
-    if (hasilEktraksi.images && hasilEktraksi.images.length > 0 && folderHasil) {
-      const https = require('https');
-      const http = require('http');
-      for (let i = 0; i < hasilEktraksi.images.length; i++) {
-        const imgUrl = hasilEktraksi.images[i];
-        const fileName = `chatgpt_IMG_${Date.now()}_${i + 1}.webp`;
-        const dest = path.join(folderHasil, fileName);
-        try {
-          const cookiesArray = await context.cookies();
-          const cookieStr = cookiesArray.map((c) => `${c.name}=${c.value}`).join('; ');
-          await new Promise((resolve, reject) => {
-            const lib = imgUrl.startsWith('https') ? https : http;
-            const req = lib.get(
-              imgUrl,
-              {
-                headers: {
-                  Cookie: cookieStr,
-                  'User-Agent': 'Mozilla/5.0',
-                  Referer: 'https://chatgpt.com/',
-                },
-              },
-              (res) => {
-                if (res.statusCode === 200 || res.statusCode === 206) {
-                  const file = fs.createWriteStream(dest);
-                  res.pipe(file);
-                  file.on('finish', () => {
-                    file.close();
-                    resolve(true);
-                  });
-                } else reject(new Error('HTTP ' + res.statusCode));
-              }
-            );
-            req.on('error', reject);
-            req.setTimeout(30000, () => {
-              req.destroy();
-              reject(new Error('Timeout'));
-            });
-          });
-          if (fs.existsSync(dest)) fileTersimpanArray.push(fileName);
-        } catch (_) {}
-      }
-    }
-
+function ghHeaders(pat) {
     return {
-      hasil: { text: hasilEktraksi.text, files: fileTersimpanArray },
-      cookieId: slot.cookieId,
+        Authorization: `Bearer ${pat}`,
+        Accept: 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28',
+        'User-Agent': 'gateway-estafet',
     };
-  } finally {
-    // Setelah tugas: rebuild slot (page bekas chat tidak di-hold ulang)
-    const id = slot.id;
-    console.log(`[POOL] slot#${id} selesai tugas → rebuild`);
-    slot.state = 'dead';
-    const fh = folderHasil;
-    destroySlot(slot)
-      .then(() => bootSlotLoop(slot, fh))
-      .catch((e) => console.error(`[POOL] rebuild slot#${id}:`, e.message));
-  }
 }
 
-async function startPool(folderHasil) {
-  if (started) {
-    console.log('[POOL] sudah started, skip');
-    return;
-  }
-  if (!deps.launchGatewayBrowser || !deps.dapatkanSesiCookie) {
-    console.error('[POOL] start ditolak: deps belum di-set');
-    return;
-  }
-  started = true;
-  console.log(`[POOL] start size=${POOL_SIZE} (sequential, hold page setelah profil)`);
-  for (let i = 0; i < POOL_SIZE; i++) {
-    slots.push({
-      id: i + 1,
-      state: 'dead',
-      browser: null,
-      context: null,
-      page: null,
-      cookieId: null,
-      readyAt: null,
-      task: null,
+const SHIFTS_PER_PAT = parseInt(process.env.SHIFTS_PER_PAT || '24', 10);
+
+const MAX_COOKIES = 150;
+const PORT = 3001;
+const app = express();
+
+app.use(cors());
+app.use(express.json({ limit: '500mb' }));
+
+const folderHasil = path.join(__dirname, 'hasil_media');
+const folderTemp = path.join(__dirname, 'temp_uploads');
+if (!fs.existsSync(folderHasil)) fs.mkdirSync(folderHasil);
+if (!fs.existsSync(folderTemp)) fs.mkdirSync(folderTemp);
+app.use('/files', express.static(folderHasil));
+
+// =====================================================================
+// RADAR PROXY (3 layer)
+// primary   = PROXY_* SOCKS (localtonet)
+// brightdata = BD_PROXY_* HTTP+auth ISP (setelah localtonet gagal)
+// static    = STATIC_* HTTP+auth Webshare (opsional L3)
+// none      = direct Codespace
+// Launch: opsi proxy Playwright (selaras bot_github.js), bukan camoufox_safe.
+// =====================================================================
+function initialProxyMode() {
+    if (PROXY_HOST && PROXY_PORT) return 'primary';
+    if (BD_PROXY_HOST && BD_PROXY_PORT) return 'brightdata';
+    if (STATIC_PROXY_HOST && STATIC_PROXY_PORT) return 'static';
+    return 'none';
+}
+let proxyMode = initialProxyMode();
+
+function curlViaProxy(proxyUrl, cb) {
+    exec(`curl -s --max-time 12 -x "${proxyUrl}" https://api.ipify.org`, (error, stdout) => {
+        if (error || !stdout || !String(stdout).trim()) cb(null);
+        else cb(String(stdout).trim());
     });
-  }
-  await bootAllSequential(folderHasil);
 }
 
-function poolStats() {
-  const c = { ready: 0, busy: 0, booting: 0, dead: 0 };
-  for (const s of slots) {
-    if (c[s.state] !== undefined) c[s.state]++;
-  }
-  return c;
+function setMode(mode, ip, logLine) {
+    if (logLine && proxyMode !== mode) console.log(logLine);
+    proxyMode = mode;
+    const healthy = mode === 'none' ? '0' : '1';
+    redis.set('proxy_healthy', healthy).catch(() => {});
+    redis.set('proxy_mode', mode).catch(() => {});
+    if (ip) redis.set('proxy_current_ip', ip).catch(() => {});
 }
 
-function isPoolReady() {
-  return started && slots.some((s) => s.state === 'ready' && slotPageAlive(s));
+function monitorProxy() {
+    if (PROXY_HOST && PROXY_PORT) {
+        const primaryUrl = `socks5h://${PROXY_HOST}:${PROXY_PORT}`;
+        return curlViaProxy(primaryUrl, (ip) => {
+            if (ip) {
+                setMode('primary', ip, `\n[NETWORK] ✅ L1 localtonet ON (IP: ${ip}).`);
+                return;
+            }
+            tryBrightDataFallback();
+        });
+    }
+    tryBrightDataFallback();
 }
 
-module.exports = {
-  setDeps,
-  startPool,
-  acquireReadySlot,
-  runTaskOnSlot,
-  poolStats,
-  isPoolReady,
-  POOL_SIZE,
+function tryBrightDataFallback() {
+    if (!BD_PROXY_HOST || !BD_PROXY_PORT) {
+        return tryStaticFallback();
+    }
+    const auth = BD_PROXY_USER
+        ? `${encodeURIComponent(BD_PROXY_USER)}:${encodeURIComponent(BD_PROXY_PASS)}@`
+        : '';
+    const bdUrl = `http://${auth}${BD_PROXY_HOST}:${BD_PROXY_PORT}`;
+    curlViaProxy(bdUrl, (ip) => {
+        if (ip) {
+            setMode('brightdata', ip, `\n[NETWORK] ⚠️ L1 mati → L2 Bright Data ISP ON (IP: ${ip})`);
+            return;
+        }
+        tryStaticFallback();
+    });
+}
+
+function tryStaticFallback() {
+    if (!STATIC_PROXY_HOST || !STATIC_PROXY_PORT) {
+        setMode('none', null, `\n[NETWORK] ⚠️ Semua proxy mati → lokal Codespace.`);
+        return;
+    }
+    const auth = STATIC_PROXY_USER
+        ? `${STATIC_PROXY_USER}:${STATIC_PROXY_PASS}@`
+        : '';
+    const staticUrl = `http://${auth}${STATIC_PROXY_HOST}:${STATIC_PROXY_PORT}`;
+    curlViaProxy(staticUrl, (ip) => {
+        if (ip) {
+            setMode('static', ip, `\n[NETWORK] ⚠️ L2 gagal → L3 STATIC Webshare ON (IP: ${ip})`);
+        } else {
+            setMode('none', null, `\n[NETWORK] ⚠️ Semua proxy mati → lokal Codespace.`);
+        }
+    });
+}
+
+const CAMOUFOX_BASE_PREFS = {
+    'webgl.force-enabled': true,
+    'webgl.disabled': false,
+    'webgl.osmesa': true,
+    'layers.acceleration.force-enabled': true,
+    'dom.maxHardwareConcurrency': 8,
+    'pdfjs.disabled': true,
+    'browser.helperApps.neverAsk.saveToDisk': 'application/pdf,image/webp',
 };
+
+/**
+ * Launch Camoufox — HTTP proxy Playwright (Bright Data / static).
+ * localtonet SOCKS TIDAK dipakai di browser (Unable to find the proxy server).
+ * Opt-in eksperimen: GATEWAY_USE_LOCALTONET=true
+ */
+async function launchGatewayBrowser() {
+    const prefs = { ...CAMOUFOX_BASE_PREFS };
+    let label = 'Local';
+    let gunakanProxy = false;
+    const camoufoxOpts = {
+        headless: true,
+        width: 1280,
+        height: 720,
+        firefoxUserPrefs: prefs,
+    };
+
+    // localtonet SOCKS di Camoufox = "Unable to find the proxy server" (lihat screenshot).
+    // Browser ChatGPT: Bright Data HTTP → STATIC → direct. Radar L1 tetap curl.
+    const useLocaltonetBrowser = process.env.GATEWAY_USE_LOCALTONET === 'true';
+
+    if (useLocaltonetBrowser && PROXY_HOST && PROXY_PORT) {
+        Object.assign(prefs, {
+            'network.proxy.type': 1,
+            'network.proxy.socks': PROXY_HOST,
+            'network.proxy.socks_port': PROXY_PORT,
+            'network.proxy.socks_version': PROXY_VERSION || 5,
+            'network.proxy.socks_remote_dns': true,
+            'network.dns.disableIPv6': true,
+        });
+        camoufoxOpts.geoip = true;
+        camoufoxOpts.firefoxUserPrefs = prefs;
+        label = 'Proxy';
+        gunakanProxy = true;
+    } else if (BD_PROXY_HOST && BD_PROXY_PORT) {
+        camoufoxOpts.geoip = true;
+        camoufoxOpts.proxy = {
+            server: `http://${BD_PROXY_HOST}:${BD_PROXY_PORT}`,
+        };
+        if (BD_PROXY_USER) camoufoxOpts.proxy.username = BD_PROXY_USER;
+        if (BD_PROXY_PASS) camoufoxOpts.proxy.password = BD_PROXY_PASS;
+        label = 'BrightData';
+        gunakanProxy = true;
+    } else if (STATIC_PROXY_HOST && STATIC_PROXY_PORT) {
+        camoufoxOpts.geoip = true;
+        camoufoxOpts.proxy = {
+            server: `http://${STATIC_PROXY_HOST}:${STATIC_PROXY_PORT}`,
+        };
+        if (STATIC_PROXY_USER) camoufoxOpts.proxy.username = STATIC_PROXY_USER;
+        if (STATIC_PROXY_PASS) camoufoxOpts.proxy.password = STATIC_PROXY_PASS;
+        label = 'Static';
+        gunakanProxy = true;
+    } else {
+        prefs['network.proxy.type'] = 0;
+        camoufoxOpts.geoip = false;
+        camoufoxOpts.firefoxUserPrefs = prefs;
+        label = 'Local';
+        gunakanProxy = false;
+    }
+
+    console.log(`[GATEWAY] launch browser net=${label} (proxyMode radar=${proxyMode})`);
+    // Hindari BrowserForge navigator.product error TANPA camoufox_safe:
+    // i_know_what_im_doing + biarkan fingerprint default OS firefox saja
+    const browser = await launchCamoufox({
+        ...camoufoxOpts,
+        block_images: false,
+        humanize: false,
+    });
+    return { browser, label, gunakanProxy };
+}
+
+setInterval(monitorProxy, 30000);
+monitorProxy();
+
+let isRetiring = false;
+let jumlahTugasAktif = 0;
+
+async function dapatkanSesiCookie() {
+    let index = await redis.incr('global_chatgpt_index');
+    if (index > MAX_COOKIES) {
+        await redis.set('global_chatgpt_index', 1);
+        index = 1;
+    }
+    const cookieKey = `cookie_chatgpt_${index}`;
+    const rawData = await redis.get(cookieKey);
+    if (!rawData) throw new Error(`[REDIS] Data tidak ditemukan: ${cookieKey}`);
+
+    const formattedCookies = Object.entries(rawData).map(([key, value]) => ({
+        name: key, value: String(value), domain: '.chatgpt.com', path: '/', secure: true, sameSite: 'Lax'
+    }));
+
+    return { id: cookieKey, cookies: formattedCookies };
+}
+
+app.post('/api/generate', async (req, res) => {
+    if (isRetiring) return res.status(503).json({ error: "Sistem estafet aktif. Silakan request ulang." });
+
+    jumlahTugasAktif++;
+
+    const { action = 'CHAT', prompt, isThinkingMode = false, fileArray = [] } = req.body;
+    let translatedFiles = [];
+
+    if (fileArray && fileArray.length > 0) {
+        fileArray.forEach((fileObj, index) => {
+            const matches = fileObj.base64 && fileObj.base64.match(/^data:(.+);base64,(.+)$/);
+            if (matches && matches.length === 3) {
+                const buffer = Buffer.from(matches[2], 'base64');
+                let originalExt = path.extname(fileObj.name || '');
+                if (!originalExt) originalExt = '.bin';
+
+                const safeName = `upload_${Date.now()}_${index}${originalExt}`;
+                const tempFilePath = path.join(folderTemp, safeName);
+                fs.writeFileSync(tempFilePath, buffer);
+                translatedFiles.push(tempFilePath);
+            }
+        });
+    }
+
+    let browser, context;
+    try {
+        const activeUrl = await redis.get('active_gateway_url') || `http://localhost:${PORT}`;
+
+        // Pool opsional: hanya jika modul ada + slot ready
+        if (poolBrowser && typeof poolBrowser.acquireReadySlot === 'function') {
+            const slot = poolBrowser.acquireReadySlot();
+            if (slot) {
+                console.log(`[GATEWAY] ⚡ Pool slot#${slot.id} cookie=${slot.cookieId}`);
+                try {
+                    const { hasil, cookieId } = await poolBrowser.runTaskOnSlot(slot, {
+                        action, prompt, isThinkingMode, translatedFiles, folderHasil,
+                    });
+                    res.json({
+                        status: 'success',
+                        worker: cookieId,
+                        network: 'pool',
+                        text: hasil.text,
+                        fileUrls: (hasil.files || []).map(f => `${activeUrl}/files/${f}`),
+                    });
+                    return;
+                } catch (poolErr) {
+                    console.error(`[GATEWAY] ⚠️ Pool gagal, cold start: ${poolErr.message}`);
+                }
+            }
+        }
+
+        // Cold start — jalur utama (sama seperti gateway asli)
+        const sesi = await dapatkanSesiCookie();
+        console.log(`[GATEWAY] 🚀 Meluncurkan tugas | Pekerja Aktif: ${jumlahTugasAktif} | Akun: ${sesi.id} | net=${proxyMode}`);
+
+        const launched = await launchGatewayBrowser();
+        browser = launched.browser;
+        context = await browser.newContext({ acceptDownloads: true });
+        await context.addCookies(sesi.cookies);
+
+        const hasil = await chatgptModule.eksekusiChatGPT(action, prompt, isThinkingMode, translatedFiles, folderHasil, context);
+
+        res.json({
+            status: 'success',
+            worker: sesi.id,
+            network: launched.label,
+            text: hasil.text,
+            fileUrls: hasil.files.map(f => `${activeUrl}/files/${f}`),
+        });
+    } catch (error) {
+        console.error(`[GATEWAY] ❌ TUGAS GAGAL: ${error.message}`);
+        res.status(500).json({ status: 'failed', error: error.message });
+    } finally {
+        jumlahTugasAktif--;
+        console.log(`[GATEWAY] 📉 Tugas selesai. Pekerja Aktif Tersisa: ${jumlahTugasAktif}`);
+
+        if (context) await context.close().catch(() => {});
+        if (browser) await browser.close().catch(() => {});
+        translatedFiles.forEach(file => { if (fs.existsSync(file)) fs.unlinkSync(file); });
+    }
+});
+
+async function jalankanDemoAwal(activeUrl) {
+    const MAX_QC_TRIES = parseInt(process.env.QC_MAX_TRIES || '3', 10);
+    const QC_RETRY_MS = parseInt(process.env.QC_RETRY_MS || '10000', 10);
+
+    console.log(`\n[SYSTEM-DEMO] 🚀 Tes QC ChatGPT (maks ${MAX_QC_TRIES} kali, jeda ${QC_RETRY_MS / 1000}s)...`);
+
+    const promptDemo = 'Berikan satu kalimat sapaan selamat datang yang sangat lucu, sedikit nyeleneh, dan penuh semangat untuk Bosku.';
+
+    for (let attempt = 1; attempt <= MAX_QC_TRIES; attempt++) {
+        let browser;
+        let context;
+        let sesi;
+        try {
+            if (attempt > 1) {
+                console.log(`[SYSTEM-DEMO] ↻ Coba lagi ${attempt}/${MAX_QC_TRIES} (cookie baru + proxy)...`);
+                monitorProxy();
+                await new Promise((r) => setTimeout(r, QC_RETRY_MS));
+            }
+
+            // Setiap percobaan ambil cookie berikutnya (index Redis naik).
+            // Cookie kadaluarsa tidak dipakai berulang di 3x QC.
+            try {
+                sesi = await dapatkanSesiCookie();
+            } catch (e) {
+                console.error(`[SYSTEM-DEMO] ❌ Gagal ambil cookie attempt ${attempt}: ${e.message}`);
+                if (attempt >= MAX_QC_TRIES) {
+                    console.log(`[SYSTEM-DEMO] ⚠️ URL Cloudflare DITAHAN.\n`);
+                    return;
+                }
+                continue;
+            }
+
+            const launched = await launchGatewayBrowser();
+            browser = launched.browser;
+            console.log(`[SYSTEM-DEMO] percobaan ${attempt}/${MAX_QC_TRIES} net=${launched.label} mode=${proxyMode} akun=${sesi.id}`);
+
+            context = await browser.newContext({ acceptDownloads: true });
+            await context.addCookies(sesi.cookies);
+
+            const hasil = await chatgptModule.eksekusiChatGPT('CHAT', promptDemo, false, [], folderHasil, context);
+
+            console.log(`\n======================================================`);
+            console.log(`🎉 [DEMO SUKSES] Percobaan ${attempt}/${MAX_QC_TRIES} — sistem sehat.`);
+            console.log(`🤖 Pesan dari ChatGPT: "${hasil.text}"`);
+
+            if (activeUrl) {
+                await redis.set('active_gateway_url', activeUrl);
+                console.log(`[SYSTEM] 🟢 TAUTAN CLOUDFLARE DIBUKA: Vercel dialihkan ke mesin ini.`);
+            }
+            console.log(`======================================================\n`);
+
+            // Setelah QC sukses + URL publik: nyalakan pool (opsional, tidak mengganggu QC)
+            if (poolBrowser && typeof poolBrowser.setDeps === 'function') {
+                try {
+                    poolBrowser.setDeps({
+                        launchGatewayBrowser,
+                        dapatkanSesiCookie,
+                        chatgptModule,
+                    });
+                    console.log(`[POOL] QC sukses — mengaktifkan pool browser...`);
+                    poolBrowser.startPool(folderHasil).catch((e) => console.error('[POOL] start gagal:', e.message));
+                } catch (e) {
+                    console.error('[POOL] init gagal:', e.message);
+                }
+            }
+            return;
+        } catch (error) {
+            console.error(`[SYSTEM-DEMO] ❌ Percobaan ${attempt}/${MAX_QC_TRIES} gagal: ${error.message}`);
+            if (attempt >= MAX_QC_TRIES) {
+                console.log(`[SYSTEM-DEMO] ⚠️ QC gagal ${MAX_QC_TRIES}x. URL Cloudflare DITAHAN. Codespace lama tetap pegang rute.\n`);
+            }
+        } finally {
+            if (context) await context.close().catch(() => {});
+            if (browser) await browser.close().catch(() => {});
+        }
+    }
+}
+
+async function jalankanProtokolEstafet() {
+    console.log(`\n[ESTAFET] ⏰ Waktu shift habis. Memulai protokol rotasi Ping-Pong...`);
+
+    const repoFullName = (
+        process.env.CODESPACE_TARGET_REPO ||
+        process.env.GITHUB_REPOSITORY ||
+        ''
+    ).trim();
+
+    if (!repoFullName || !repoFullName.includes('/')) {
+        console.error('[ESTAFET] ❌ Set CODESPACE_TARGET_REPO=owner/repo di .env (atau pastikan GITHUB_REPOSITORY ada).');
+        return;
+    }
+
+    let isSuccess = false;
+    let nextPat = null;
+    const ESTAFET_WAIT_MS = 30000;
+
+    let rawMyPat0 = await redis.get('current_active_pat');
+    let myPat = (typeof rawMyPat0 === 'string' ? rawMyPat0 : '').trim();
+
+    while (!isSuccess) {
+        let rawMyPat = await redis.get('current_active_pat');
+        myPat = (typeof rawMyPat === 'string' ? rawMyPat : myPat).trim();
+
+        let rawPats = await redis.lrange('github_pats', 0, -1);
+        if (!Array.isArray(rawPats)) rawPats = [];
+        rawPats = rawPats.map(p => String(p).trim()).filter(Boolean);
+
+        let patShifts = await redis.get('pat_shift_quota') || {};
+        if (typeof patShifts !== 'object' || patShifts === null) patShifts = {};
+        for (const pat of rawPats) {
+            if (patShifts[pat] === undefined) patShifts[pat] = SHIFTS_PER_PAT;
+        }
+
+        let validPats = rawPats.filter(pat => (patShifts[pat] || 0) > 0);
+        let candidates = validPats.filter(pat => pat !== myPat);
+        if (candidates.length === 0) candidates = validPats.slice();
+
+        if (candidates.length === 0) {
+            console.log(`[ESTAFET] ⏳ Stok PAT kosong / semua ban. Mesin ini TETAP bekerja, menunggu bot_github menambah PAT...`);
+            await new Promise(r => setTimeout(r, ESTAFET_WAIT_MS));
+            continue;
+        }
+
+        nextPat = candidates[0];
+        console.log(`[ESTAFET] 🔄 Coba bangunkan penerus dengan PAT: ${nextPat.substring(0, 8)}... (sisa kandidat: ${candidates.length})`);
+
+        try {
+            const checkRes = await fetch('https://api.github.com/user/codespaces', {
+                headers: ghHeaders(nextPat)
+            });
+            if (checkRes.ok) {
+                const checkData = await checkRes.json();
+                if (checkData.codespaces && checkData.codespaces.length > 0) {
+                    console.log(`[ESTAFET] 🧹 Bersihkan ${checkData.codespaces.length} codespace usang...`);
+                    for (let cs of checkData.codespaces) {
+                        await fetch(`https://api.github.com/user/codespaces/${cs.name}`, {
+                            method: 'DELETE',
+                            headers: ghHeaders(nextPat)
+                        });
+                    }
+                }
+            }
+
+            const repoRes = await fetch(`https://api.github.com/repos/${repoFullName}`, {
+                headers: ghHeaders(nextPat)
+            });
+            if (!repoRes.ok) throw new Error('Gagal akses Repo. PAT flagged/dicabut atau tidak bisa dihidupkan.');
+            const repoData = await repoRes.json();
+
+            const createRes = await fetch('https://api.github.com/user/codespaces', {
+                method: 'POST',
+                headers: { ...ghHeaders(nextPat), 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    repository_id: repoData.id,
+                    idle_timeout_minutes: 240
+                })
+            });
+            if (!createRes.ok) {
+                const errTxt = await createRes.text();
+                throw new Error(`API Error (tidak bisa dihidupkan): ${errTxt}`);
+            }
+
+            console.log(`[ESTAFET] ✅ Penerus sukses dipesan, sedang booting!`);
+            isSuccess = true;
+
+            patShifts[nextPat] = (patShifts[nextPat] || SHIFTS_PER_PAT) - 1;
+            await redis.set('pat_shift_quota', patShifts);
+            await redis.set('current_active_pat', nextPat.trim());
+
+            if (patShifts[nextPat] <= 0) {
+                await redis.lrem('github_pats', 1, nextPat);
+                delete patShifts[nextPat];
+                await redis.set('pat_shift_quota', patShifts);
+                console.log(`[ESTAFET] PAT ${nextPat.substring(0, 8)}... kuota habis → LREM`);
+            }
+        } catch (err) {
+            console.error(`[ESTAFET] ❌ PAT ${nextPat.substring(0, 8)}... gagal dihidupkan: ${err.message}`);
+            console.log(`[ESTAFET] ⚠️ LREM PAT ini dari stok, mesin tetap bekerja, cari pengganti lain...`);
+            await redis.lrem('github_pats', 1, nextPat);
+            delete patShifts[nextPat];
+            await redis.set('pat_shift_quota', patShifts);
+            await new Promise(r => setTimeout(r, 3000));
+        }
+    }
+
+    console.log(`[ESTAFET] 📡 Menunggu mesin penerus menyelesaikan QC dan mengambil alih rute Cloudflare...`);
+    const oldUrl = await redis.get('active_gateway_url');
+
+    const pantauPengambilalihan = setInterval(async () => {
+        const currentUrl = await redis.get('active_gateway_url');
+
+        if (currentUrl && currentUrl !== oldUrl) {
+            clearInterval(pantauPengambilalihan);
+            console.log(`\n[ESTAFET] 🔄 PENGAMBILALIHAN BERHASIL! Rute tugas telah berpindah.`);
+
+            isRetiring = true;
+            console.log(`[ESTAFET] 🛑 Menolak tugas baru. Menunggu ${jumlahTugasAktif} tugas tersisa diselesaikan...`);
+
+            let batasWaktuTunggu = 60;
+
+            const cekSisaTugas = setInterval(async () => {
+                batasWaktuTunggu--;
+                if (jumlahTugasAktif === 0 || batasWaktuTunggu <= 0) {
+                    clearInterval(cekSisaTugas);
+
+                    if (batasWaktuTunggu <= 0) console.log(`[ESTAFET] ⚠️ Waktu habis! Memaksa pembersihan tugas yang nyangkut.`);
+                    console.log(`[ESTAFET] 🪦 Memulai penghancuran diri (Self-Destruct)...`);
+
+                    try {
+                        const currentCodespaceName = process.env.CODESPACE_NAME;
+                        if (currentCodespaceName && myPat) {
+                            const delRes = await fetch(`https://api.github.com/user/codespaces/${currentCodespaceName}`, {
+                                method: 'DELETE',
+                                headers: ghHeaders(myPat)
+                            });
+                            console.log(`[ESTAFET] Laporan Status Hancur Diri: HTTP ${delRes.status}`);
+                        }
+                    } catch (e) {
+                        console.error(`[ESTAFET] Kesalahan saat memanggil API Hancur Diri: ${e.message}`);
+                    }
+                    process.exit(0);
+                }
+            }, 5000);
+        }
+    }, 10000);
+}
+
+app.listen(PORT, async () => {
+    console.log(`🚀 API Gateway Camoufox menyala di Port ${PORT}`);
+
+    const rawMyPat = await redis.get('current_active_pat');
+    const myPat = (typeof rawMyPat === 'string' ? rawMyPat : '').trim();
+
+    if (!myPat) {
+        const first = await redis.lindex('github_pats', 0);
+        if (first) await redis.set('current_active_pat', String(first).trim());
+    }
+
+    startDeadman(redis);
+
+    console.log(`[SYSTEM] 🚇 Memulai inisiasi Cloudflare Tunnel seketika...`);
+    const cloudflaredPath = path.join(__dirname, 'cloudflared');
+    try {
+        if (!fs.existsSync(cloudflaredPath)) {
+            console.log(`[SYSTEM] ⬇️ Mengunduh Cloudflared...`);
+            require('child_process').execSync(`wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O "${cloudflaredPath}" && chmod +x "${cloudflaredPath}"`);
+        }
+
+        const cf = spawn(cloudflaredPath, ['tunnel', '--url', `http://localhost:${PORT}`]);
+        let urlFound = false;
+
+        cf.stderr.on('data', async (data) => {
+            const match = data.toString().match(/https:\/\/[a-zA-Z0-9-]+\.trycloudflare\.com/);
+            if (match && !urlFound) {
+                urlFound = true;
+                const activeUrl = match[0];
+
+                console.log(`[SYSTEM] 🔎 Terowongan Tertangkap: ${activeUrl}`);
+                console.log(`[SYSTEM] 🛑 Menahan publikasi URL ke Vercel sampai QC Test selesai...`);
+
+                const SHIFT_DURATION_MS = parseInt(process.env.SHIFT_DURATION_MS || String(30 * 60 * 1000), 10);
+                setTimeout(jalankanProtokolEstafet, SHIFT_DURATION_MS);
+
+                await jalankanDemoAwal(activeUrl);
+            }
+        });
+
+        cf.on('close', () => {
+            if (!urlFound) console.log(`[SYSTEM] ❌ Cloudflare terputus secara tak wajar.`);
+        });
+    } catch (err) {
+        console.error(`[SYSTEM] ❌ Gagal menjalankan Cloudflare:`, err.message);
+    }
+});
