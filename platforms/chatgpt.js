@@ -49,116 +49,110 @@ async function stepShot(page, folderHasil, label) {
 async function klikGotItJikaAda(page) {
     let n = 0;
     try {
-        // Modal memory NUX spesifik (data-testid + role=dialog)
-        // Teks "Got it" ada di <div> di dalam <button class="btn-primary">
-        const strategies = [
-            async () => {
-                const btn = page.locator('#modal-m3m-nux [role="dialog"] button.btn-primary').filter({ hasText: /got it/i });
-                if (await btn.count() && await btn.first().isVisible().catch(() => false)) {
-                    await btn.first().click({ timeout: 2500, force: true });
-                    return 1;
-                }
-                return 0;
-            },
-            async () => {
-                const btn = page.locator('[data-testid="modal-m3m-nux"] button.btn-primary');
-                if (await btn.count() && await btn.first().isVisible().catch(() => false)) {
-                    await btn.first().click({ timeout: 2500, force: true });
-                    return 1;
-                }
-                return 0;
-            },
-            async () => {
-                const btn = page.getByRole('dialog').getByRole('button', { name: /got it/i });
-                if (await btn.count() && await btn.first().isVisible().catch(() => false)) {
-                    await btn.first().click({ timeout: 2500, force: true });
-                    return 1;
-                }
-                return 0;
-            },
-            async () => {
-                const btn = page.locator('[role="dialog"] button.btn-primary').filter({ hasText: /got it|mengerti/i });
-                if (await btn.count() && await btn.first().isVisible().catch(() => false)) {
-                    await btn.first().click({ timeout: 2500, force: true });
-                    return 1;
-                }
-                return 0;
-            },
+        // Tombol ID: "Mengerti" | EN: "Got it" — nested text di dalam button.btn-primary
+        // Focus biru di SS = ter-focus tapi belum activate → wajib Enter/Space setelah focus
+        const locators = [
+            page.locator('#modal-m3m-nux button.btn-primary'),
+            page.locator('[data-testid="modal-m3m-nux"] button.btn-primary'),
+            page.locator('[role="dialog"][data-state="open"] button.btn-primary'),
+            page.getByRole('dialog').getByRole('button', { name: /mengerti|got it/i }),
+            page.locator('[role="dialog"] button').filter({ hasText: /^(Mengerti|Got it)$/i }),
         ];
-        for (const fn of strategies) {
+
+        for (const loc of locators) {
+            const count = await loc.count().catch(() => 0);
+            if (!count) continue;
+            const btn = loc.first();
+            const vis = await btn.isVisible().catch(() => false);
+            if (!vis) continue;
+
             try {
-                const c = await fn();
-                n += c;
-                if (c > 0) break;
+                await btn.scrollIntoViewIfNeeded().catch(() => {});
+                await btn.focus({ timeout: 1000 }).catch(() => {});
+                // Activate seperti keyboard user (focus ring biru → Enter)
+                await page.keyboard.press('Enter');
+                await page.waitForTimeout(200);
+                // Double: Space juga
+                await page.keyboard.press('Space');
+                await page.waitForTimeout(150);
+                // Playwright click force
+                await btn.click({ timeout: 2000, force: true }).catch(() => {});
+                n++;
+                break;
             } catch (_) {}
         }
 
-        // Evaluate: temukan button yang anaknya berisi Got it + restore pointer-events body
+        // Evaluate: pointer sequence + keyboard pada elemen focused
         const n2 = await page.evaluate(() => {
             let c = 0;
-            const fire = (el) => {
-                try {
-                    el.focus();
-                    el.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, view: window }));
-                    el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
-                    el.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true, view: window }));
-                    el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
-                    el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
-                    el.click();
-                    c++;
-                } catch (e) {}
-            };
-
-            // Body di-lock: pointer-events none — angkat sementara
             const body = document.body;
-            const prevPe = body.style.pointerEvents;
-            const prevScroll = body.getAttribute('data-scroll-locked');
             body.style.pointerEvents = 'auto';
 
-            const roots = [
-                document.querySelector('#modal-m3m-nux'),
-                document.querySelector('[data-testid="modal-m3m-nux"]'),
-                ...document.querySelectorAll('[role="dialog"][data-state="open"]'),
-            ].filter(Boolean);
-
-            for (const root of roots.length ? roots : [document]) {
-                const buttons = root.querySelectorAll('button');
-                for (const b of buttons) {
-                    const label = (b.innerText || b.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
-                    // Nested: <button><div>Got it</div></button>
-                    if (label === 'got it' || label === 'mengerti' || label === 'saya mengerti') {
-                        fire(b);
+            const pick = () => {
+                const roots = [
+                    document.querySelector('#modal-m3m-nux'),
+                    document.querySelector('[data-testid="modal-m3m-nux"]'),
+                    ...document.querySelectorAll('[role="dialog"][data-state="open"]'),
+                ].filter(Boolean);
+                for (const root of roots) {
+                    const primary = root.querySelector('button.btn-primary');
+                    if (primary) {
+                        const t = (primary.innerText || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                        if (t.includes('mengerti') || t.includes('got it') || t === '') return primary;
+                    }
+                    for (const b of root.querySelectorAll('button')) {
+                        const t = (b.innerText || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                        if (t === 'mengerti' || t === 'got it') return b;
                     }
                 }
-                // btn-primary di dalam dialog NUX
-                const primary = root.querySelector('button.btn-primary');
-                if (primary) {
-                    const pl = (primary.innerText || '').replace(/\s+/g, ' ').trim().toLowerCase();
-                    if (pl.includes('got it') || pl.includes('mengerti') || root.id === 'modal-m3m-nux' || root.getAttribute('data-testid') === 'modal-m3m-nux') {
-                        // Hindari Settings (btn-secondary)
-                        if (!pl.includes('settings') && !pl.includes('setelan')) fire(primary);
-                    }
-                }
-            }
+                return null;
+            };
 
-            // Jika masih ada dialog NUX, hapus overlay (last resort)
-            const still = document.querySelector('#modal-m3m-nux [role="dialog"][data-state="open"], [data-testid="modal-m3m-nux"] [data-state="open"]');
-            if (still && c === 0) {
-                try {
-                    const wrap = document.getElementById('modal-m3m-nux');
-                    if (wrap) wrap.remove();
-                    body.removeAttribute('data-scroll-locked');
-                    body.style.pointerEvents = '';
-                    c++;
-                } catch (e) {}
-            } else {
-                body.style.pointerEvents = prevPe || '';
+            const el = pick();
+            if (!el) return 0;
+
+            try {
+                el.focus();
+                // Keyboard activate
+                el.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
+                el.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
+                // Pointer
+                const r = el.getBoundingClientRect();
+                const x = r.left + r.width / 2;
+                const y = r.top + r.height / 2;
+                for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+                    el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y }));
+                }
+                el.click();
+                c++;
+            } catch (e) {}
+
+            // Masih open? hapus modal
+            const open = document.querySelector('#modal-m3m-nux [data-state="open"], [data-testid="modal-m3m-nux"] [data-state="open"], [role="dialog"][data-state="open"]');
+            if (open && /mengerti|got it|personalized|dipersonalisasi|lebih relevan/i.test(open.innerText || '')) {
+                const wrap = document.getElementById('modal-m3m-nux') || document.querySelector('[data-testid="modal-m3m-nux"]');
+                if (wrap) {
+                    try { wrap.remove(); c++; } catch (e) {}
+                } else {
+                    try { open.remove(); c++; } catch (e) {}
+                }
+                body.removeAttribute('data-scroll-locked');
+                body.style.pointerEvents = '';
             }
             return c;
         }).catch(() => 0);
         n += n2;
 
-        if (n > 0) console.log(`[CHATGPT] 🧹 Dismiss NUX/Got it x${n}`);
+        // Verifikasi dialog sudah hilang; jika belum, Escape
+        const still = await page.locator('#modal-m3m-nux [role="dialog"][data-state="open"], [data-testid="modal-m3m-nux"] [data-state="open"]').count().catch(() => 0);
+        if (still > 0) {
+            await page.keyboard.press('Escape').catch(() => {});
+            await page.waitForTimeout(200);
+            await page.keyboard.press('Enter').catch(() => {});
+            n++;
+        }
+
+        if (n > 0) console.log(`[CHATGPT] 🧹 Dismiss NUX (Mengerti/Got it) x${n}`);
     } catch (_) {}
     return n;
 }
