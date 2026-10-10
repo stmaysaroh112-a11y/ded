@@ -52,32 +52,18 @@ async function installPopupKiller(page) {
       );
     };
     const dismissPopups = () => {
-      // 1) Semua tombol teks
-      document.querySelectorAll('button, [role="button"], a').forEach((btn) => {
-        if (isDismissLabel(btn.textContent || btn.innerText)) {
-          try { btn.click(); } catch (e) {}
+      // Hanya modal NUX — jangan klik semua tombol di page
+      const nux = document.querySelector('#modal-m3m-nux, [data-testid="modal-m3m-nux"]');
+      if (!nux) return;
+      const open = nux.querySelector('[data-state="open"], [role="dialog"]');
+      if (!open) return;
+      const primary = nux.querySelector('button.btn-primary');
+      if (primary) {
+        const t = (primary.innerText || '').replace(/\s+/g, ' ').trim().toLowerCase();
+        if (t.includes('mengerti') || t.includes('got it')) {
+          try { primary.click(); } catch (e) {}
         }
-      });
-      // 2) Dialog radix / memory NUX (EN + ID)
-      document.querySelectorAll('[role="dialog"], [data-state="open"]').forEach((d) => {
-        const t = d.innerText || '';
-        if (
-          /more relevant|personalized replies|个性化|already uploaded|memori|memory/i.test(t)
-        ) {
-          const btn = Array.from(d.querySelectorAll('button, [role="button"]')).find((b) =>
-            isDismissLabel(b.textContent || b.innerText)
-          );
-          if (btn) {
-            try { btn.click(); } catch (e) {}
-          } else {
-            // primary button di dialog (biasanya Got it)
-            const primary = d.querySelector('button.btn-primary, button[class*="btn-primary"]');
-            if (primary) {
-              try { primary.click(); } catch (e) {}
-            }
-          }
-        }
-      });
+      }
     };
     if (!window.__poolPopupKillerInstalled) {
       window.__poolPopupKillerInstalled = true;
@@ -89,92 +75,39 @@ async function installPopupKiller(page) {
   });
 }
 
-/** Node-side: tetap klik Got it selama slot READY (pending tunggu tugas) */
+/** Node-side: hanya dismiss modal NUX saat slot READY — tidak spam focus/Enter */
 function startKeepAlivePopupGuard(slot) {
   stopKeepAlivePopupGuard(slot);
   const tick = async () => {
     if (slot.state !== 'ready' || !slot.page) return;
     try {
       if (typeof slot.page.isClosed === 'function' && slot.page.isClosed()) return;
-      let n = 0;
-      try {
-        const locs = [
-          slot.page.getByRole('button', { name: /^got it$/i }),
-          slot.page.getByRole('button', { name: /^mengerti$/i }),
-          slot.page.locator('[role="dialog"] button.btn-primary'),
-          slot.page.locator('button:has-text("Got it")'),
-          slot.page.locator('button:has-text("Mengerti")'),
-        ];
-        for (const loc of locs) {
-          const count = await loc.count().catch(() => 0);
-          for (let i = 0; i < Math.min(count, 3); i++) {
-            const btn = loc.nth(i);
-            if (await btn.isVisible().catch(() => false)) {
-              await btn.click({ timeout: 2000, force: true }).catch(async () => {
-                try { await btn.evaluate((el) => el.click()); } catch (_) {}
-              });
-              n++;
-            }
-          }
-        }
-      } catch (_) {}
 
-      // Fallback evaluate
-      // Playwright: modal NUX (Mengerti / Got it) — focus + Enter (SS: ring biru = focused belum activate)
-      try {
-        const nuxBtn = slot.page.locator(
-          '#modal-m3m-nux button.btn-primary, [data-testid="modal-m3m-nux"] button.btn-primary, [role="dialog"][data-state="open"] button.btn-primary'
-        ).filter({ hasText: /got it|mengerti/i });
-        if (await nuxBtn.count() && await nuxBtn.first().isVisible().catch(() => false)) {
-          const b = nuxBtn.first();
-          await b.focus({ timeout: 1000 }).catch(() => {});
-          await slot.page.keyboard.press('Enter');
-          await slot.page.waitForTimeout(150);
-          await b.click({ timeout: 2000, force: true }).catch(() => {});
-          n++;
-        }
-      } catch (_) {}
+      const open = slot.page.locator(
+        '#modal-m3m-nux [data-state="open"], [data-testid="modal-m3m-nux"] [data-state="open"]'
+      );
+      if (!(await open.count().catch(() => 0))) return;
+      if (!(await open.first().isVisible().catch(() => false))) return;
 
-      const n2 = await slot.page.evaluate(() => {
-        let c = 0;
-        const fire = (el) => {
-          try {
-            el.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
-            el.dispatchEvent(new MouseEvent('click', { bubbles: true }));
-            el.click();
-            c++;
-          } catch (e) {}
-        };
-        document.body.style.pointerEvents = 'auto';
-        const nux = document.querySelector('#modal-m3m-nux, [data-testid="modal-m3m-nux"]');
-        if (nux) {
-          const primary = nux.querySelector('button.btn-primary');
-          if (primary) fire(primary);
-          nux.querySelectorAll('button').forEach((b) => {
-            const t = (b.innerText || '').replace(/\s+/g, ' ').trim().toLowerCase();
-            if (t === 'got it' || t === 'mengerti') fire(b);
-          });
-        }
-        document.querySelectorAll('[role="dialog"] button.btn-primary').forEach((b) => {
-          const t = (b.innerText || '').toLowerCase();
-          if (t.includes('got it') || t.includes('mengerti')) fire(b);
-        });
-        // last resort remove overlay
-        if (c === 0 && nux) {
-          try { nux.remove(); document.body.removeAttribute('data-scroll-locked'); document.body.style.pointerEvents = ''; c++; } catch (e) {}
-        }
-        return c;
-      }).catch(() => 0);
-      n += n2;
+      const btn = slot.page.locator(
+        '#modal-m3m-nux button.btn-primary, [data-testid="modal-m3m-nux"] button.btn-primary'
+      ).filter({ hasText: /^(Mengerti|Got it)$/i }).first();
 
-      if (n > 0) {
-        console.log(`[POOL] slot#${slot.id} keep-alive: klik popup x${n}`);
-      }
-    } catch (_) {
-      // page navigasi / transient — abaikan
-    }
+      if (!(await btn.count().catch(() => 0))) return;
+      if (!(await btn.isVisible().catch(() => false))) return;
+
+      await btn.click({ timeout: 2000, force: true });
+      await slot.page.evaluate(() => {
+        const body = document.body;
+        if (!document.querySelector('#modal-m3m-nux [data-state="open"], [data-testid="modal-m3m-nux"] [data-state="open"]')) {
+          body.removeAttribute('data-scroll-locked');
+          if (body.style.pointerEvents === 'none') body.style.pointerEvents = '';
+        }
+      }).catch(() => {});
+      console.log(`[POOL] slot#${slot.id} keep-alive: NUX dismissed`);
+    } catch (_) {}
   };
-  slot._keepAliveTimer = setInterval(tick, 1000);
+  slot._keepAliveTimer = setInterval(tick, 2500);
   tick();
 }
 
