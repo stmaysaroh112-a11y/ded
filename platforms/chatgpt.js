@@ -49,71 +49,120 @@ async function stepShot(page, folderHasil, label) {
 async function klikGotItJikaAda(page) {
     let n = 0;
     try {
-        // 1) Role/dialog scoped — paling spesifik
-        const candidates = [
-            page.getByRole('button', { name: /^got it$/i }),
-            page.getByRole('button', { name: /^mengerti$/i }),
-            page.getByRole('button', { name: /^saya mengerti$/i }),
-            page.getByRole('button', { name: /^okay$/i }),
-            page.getByRole('button', { name: /^ok$/i }),
-            page.locator('[role="dialog"] button.btn-primary'),
-            page.locator('[role="dialog"] button[class*="btn-primary"]'),
-            page.locator('button:has-text("Got it")'),
-            page.locator('button:has-text("Mengerti")'),
+        // Modal memory NUX spesifik (data-testid + role=dialog)
+        // Teks "Got it" ada di <div> di dalam <button class="btn-primary">
+        const strategies = [
+            async () => {
+                const btn = page.locator('#modal-m3m-nux [role="dialog"] button.btn-primary').filter({ hasText: /got it/i });
+                if (await btn.count() && await btn.first().isVisible().catch(() => false)) {
+                    await btn.first().click({ timeout: 2500, force: true });
+                    return 1;
+                }
+                return 0;
+            },
+            async () => {
+                const btn = page.locator('[data-testid="modal-m3m-nux"] button.btn-primary');
+                if (await btn.count() && await btn.first().isVisible().catch(() => false)) {
+                    await btn.first().click({ timeout: 2500, force: true });
+                    return 1;
+                }
+                return 0;
+            },
+            async () => {
+                const btn = page.getByRole('dialog').getByRole('button', { name: /got it/i });
+                if (await btn.count() && await btn.first().isVisible().catch(() => false)) {
+                    await btn.first().click({ timeout: 2500, force: true });
+                    return 1;
+                }
+                return 0;
+            },
+            async () => {
+                const btn = page.locator('[role="dialog"] button.btn-primary').filter({ hasText: /got it|mengerti/i });
+                if (await btn.count() && await btn.first().isVisible().catch(() => false)) {
+                    await btn.first().click({ timeout: 2500, force: true });
+                    return 1;
+                }
+                return 0;
+            },
         ];
-        for (const loc of candidates) {
-            const count = await loc.count().catch(() => 0);
-            for (let i = 0; i < Math.min(count, 3); i++) {
-                const b = loc.nth(i);
-                const vis = await b.isVisible().catch(() => false);
-                if (!vis) continue;
-                // force: true menembus overlay pointer-events
-                await b.click({ timeout: 2000, force: true }).catch(async () => {
-                    try {
-                        await b.evaluate((el) => el.click());
-                    } catch (_) {}
-                });
-                n++;
-            }
+        for (const fn of strategies) {
+            try {
+                const c = await fn();
+                n += c;
+                if (c > 0) break;
+            } catch (_) {}
         }
-        // 2) Evaluate fallback: dispatch events seperti user
+
+        // Evaluate: temukan button yang anaknya berisi Got it + restore pointer-events body
         const n2 = await page.evaluate(() => {
-            const match = (raw) => {
-                const t = (raw || '').replace(/\s+/g, ' ').trim().toLowerCase();
-                return /^(got it|mengerti|saya mengerti|baik|okay|ok|continue|lanjutkan|stay logged out|知道了)$/i.test(t);
-            };
             let c = 0;
             const fire = (el) => {
                 try {
-                    el.dispatchEvent(new MouseEvent('pointerdown', { bubbles: true }));
-                    el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
-                    el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
-                    el.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+                    el.focus();
+                    el.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, view: window }));
+                    el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+                    el.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true, view: window }));
+                    el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+                    el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
                     el.click();
                     c++;
                 } catch (e) {}
             };
-            document.querySelectorAll('button, [role="button"]').forEach((b) => {
-                if (match(b.textContent || b.innerText)) fire(b);
-            });
-            document.querySelectorAll('[role="dialog"], [data-state="open"]').forEach((d) => {
-                const t = d.innerText || '';
-                if (/more relevant|personalized|memori|memory|个性化/i.test(t)) {
-                    const primary =
-                        Array.from(d.querySelectorAll('button')).find((b) => match(b.textContent)) ||
-                        d.querySelector('button.btn-primary, button[class*="btn-primary"]');
-                    if (primary) fire(primary);
+
+            // Body di-lock: pointer-events none — angkat sementara
+            const body = document.body;
+            const prevPe = body.style.pointerEvents;
+            const prevScroll = body.getAttribute('data-scroll-locked');
+            body.style.pointerEvents = 'auto';
+
+            const roots = [
+                document.querySelector('#modal-m3m-nux'),
+                document.querySelector('[data-testid="modal-m3m-nux"]'),
+                ...document.querySelectorAll('[role="dialog"][data-state="open"]'),
+            ].filter(Boolean);
+
+            for (const root of roots.length ? roots : [document]) {
+                const buttons = root.querySelectorAll('button');
+                for (const b of buttons) {
+                    const label = (b.innerText || b.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                    // Nested: <button><div>Got it</div></button>
+                    if (label === 'got it' || label === 'mengerti' || label === 'saya mengerti') {
+                        fire(b);
+                    }
                 }
-            });
+                // btn-primary di dalam dialog NUX
+                const primary = root.querySelector('button.btn-primary');
+                if (primary) {
+                    const pl = (primary.innerText || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                    if (pl.includes('got it') || pl.includes('mengerti') || root.id === 'modal-m3m-nux' || root.getAttribute('data-testid') === 'modal-m3m-nux') {
+                        // Hindari Settings (btn-secondary)
+                        if (!pl.includes('settings') && !pl.includes('setelan')) fire(primary);
+                    }
+                }
+            }
+
+            // Jika masih ada dialog NUX, hapus overlay (last resort)
+            const still = document.querySelector('#modal-m3m-nux [role="dialog"][data-state="open"], [data-testid="modal-m3m-nux"] [data-state="open"]');
+            if (still && c === 0) {
+                try {
+                    const wrap = document.getElementById('modal-m3m-nux');
+                    if (wrap) wrap.remove();
+                    body.removeAttribute('data-scroll-locked');
+                    body.style.pointerEvents = '';
+                    c++;
+                } catch (e) {}
+            } else {
+                body.style.pointerEvents = prevPe || '';
+            }
             return c;
         }).catch(() => 0);
         n += n2;
-        if (n > 0) console.log(`[CHATGPT] 🧹 Klik dismiss popup x${n}`);
+
+        if (n > 0) console.log(`[CHATGPT] 🧹 Dismiss NUX/Got it x${n}`);
     } catch (_) {}
     return n;
 }
 
-/** Guard Node selama page tugas hidup (bukan hanya loop profil) */
 function startChatgptPopupGuard(page) {
     const timer = setInterval(() => {
         klikGotItJikaAda(page).catch(() => {});
@@ -301,14 +350,27 @@ async function eksekusiChatGPT(tipeTugas, promptTeks, isThinkingMode, fileInputD
                     try { btn.click(); } catch (e) {}
                 }
             });
+            // Modal memory NUX khusus
+            const nux = document.querySelector('#modal-m3m-nux, [data-testid="modal-m3m-nux"]');
+            if (nux) {
+                const primary = nux.querySelector('button.btn-primary');
+                if (primary) {
+                    try { primary.click(); } catch (e) {}
+                }
+                nux.querySelectorAll('button').forEach((b) => {
+                    if (isDismissLabel(b.textContent || b.innerText)) {
+                        try { b.click(); } catch (e) {}
+                    }
+                });
+            }
             document.querySelectorAll('[role="dialog"], [data-state="open"]').forEach((d) => {
                 const t = d.innerText || '';
                 if (/more relevant|personalized replies|个性化|already uploaded|memori|memory/i.test(t)) {
                     const gotIt = Array.from(d.querySelectorAll('button')).find((b) =>
                         isDismissLabel(b.textContent || b.innerText)
                     );
-                    const primary = gotIt || d.querySelector('button.btn-primary, button[class*="btn-primary"]');
-                    if (primary) {
+                    const primary = gotIt || d.querySelector('button.btn-primary');
+                    if (primary && !(primary.innerText || '').toLowerCase().includes('settings')) {
                         try { primary.click(); } catch (e) {}
                     }
                 }
