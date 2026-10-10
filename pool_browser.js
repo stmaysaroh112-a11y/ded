@@ -120,31 +120,43 @@ function startKeepAlivePopupGuard(slot) {
       } catch (_) {}
 
       // Fallback evaluate
+      // Playwright: modal NUX spesifik
+      try {
+        const nuxBtn = slot.page.locator('#modal-m3m-nux button.btn-primary, [data-testid="modal-m3m-nux"] button.btn-primary').filter({ hasText: /got it/i });
+        if (await nuxBtn.count() && await nuxBtn.first().isVisible().catch(() => false)) {
+          await nuxBtn.first().click({ timeout: 2500, force: true });
+          n++;
+        }
+      } catch (_) {}
+
       const n2 = await slot.page.evaluate(() => {
-        const isDismissLabel = (raw) => {
-          const t = (raw || '').replace(/\s+/g, ' ').trim().toLowerCase();
-          return (
-            t === 'got it' || t === 'mengerti' || t === 'saya mengerti' ||
-            t === 'baik' || t === 'okay' || t === 'ok' ||
-            t === 'continue' || t === 'lanjutkan' || t === 'stay logged out' || t === '知道了'
-          );
-        };
         let c = 0;
-        document.querySelectorAll('button, [role="button"]').forEach((b) => {
-          if (isDismissLabel(b.textContent || b.innerText)) {
-            try { b.click(); c++; } catch (e) {}
-          }
+        const fire = (el) => {
+          try {
+            el.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
+            el.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            el.click();
+            c++;
+          } catch (e) {}
+        };
+        document.body.style.pointerEvents = 'auto';
+        const nux = document.querySelector('#modal-m3m-nux, [data-testid="modal-m3m-nux"]');
+        if (nux) {
+          const primary = nux.querySelector('button.btn-primary');
+          if (primary) fire(primary);
+          nux.querySelectorAll('button').forEach((b) => {
+            const t = (b.innerText || '').replace(/\s+/g, ' ').trim().toLowerCase();
+            if (t === 'got it' || t === 'mengerti') fire(b);
+          });
+        }
+        document.querySelectorAll('[role="dialog"] button.btn-primary').forEach((b) => {
+          const t = (b.innerText || '').toLowerCase();
+          if (t.includes('got it') || t.includes('mengerti')) fire(b);
         });
-        document.querySelectorAll('[role="dialog"], [data-state="open"]').forEach((d) => {
-          const text = d.innerText || '';
-          if (/more relevant|personalized replies|memori|memory|个性化/i.test(text)) {
-            const gotIt = Array.from(d.querySelectorAll('button')).find((b) => isDismissLabel(b.textContent));
-            const primary = gotIt || d.querySelector('button.btn-primary, button[class*="btn-primary"]');
-            if (primary) {
-              try { primary.click(); c++; } catch (e) {}
-            }
-          }
-        });
+        // last resort remove overlay
+        if (c === 0 && nux) {
+          try { nux.remove(); document.body.removeAttribute('data-scroll-locked'); document.body.style.pointerEvents = ''; c++; } catch (e) {}
+        }
         return c;
       }).catch(() => 0);
       n += n2;
