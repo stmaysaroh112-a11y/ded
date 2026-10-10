@@ -648,19 +648,108 @@ async function eksekusiChatGPT(tipeTugas, promptTeks, isThinkingMode, fileInputD
         await page.waitForTimeout(1000);
 
         await pastikanNuxHilang(page, 'sebelum send');
-        console.log(`[CHATGPT] ⏳ Menunggu tombol Send siap...`);
-        await page.waitForFunction(() => {
-            const sendBtn = document.querySelector('[data-testid="send-button"]');
-            if (!sendBtn) return false;
-            return !(sendBtn.disabled || sendBtn.hasAttribute('disabled') || sendBtn.getAttribute('aria-disabled') === 'true'); 
-        }, { timeout: 120000 }).catch(()=>{}); 
 
-        console.log(`[CHATGPT] 🚀 Tombol Send siap! Mengirim tugas...`);
-        await page.evaluate(() => { 
-            const sendBtn = document.querySelector('[data-testid="send-button"]'); 
-            if (sendBtn) sendBtn.click(); 
-        });
+        // Pastikan composer masih berisi teks (NUX kadang mengosongkan / gagal inject)
+        const isiComposer = await page.evaluate(() => {
+            const el =
+                document.querySelector('#prompt-textarea') ||
+                document.querySelector('[data-testid="prompt-textarea"]') ||
+                document.querySelector('div.ProseMirror[contenteditable="true"]');
+            if (!el) return '';
+            return (el.innerText || el.textContent || el.value || '').trim();
+        }).catch(() => '');
+        if (!isiComposer || isiComposer.length < 2) {
+            console.log('[CHATGPT] ⚠️ Composer kosong setelah NUX — suntik ulang prompt');
+            await page.evaluate((teks) => {
+                const el =
+                    document.querySelector('#prompt-textarea') ||
+                    document.querySelector('[data-testid="prompt-textarea"]') ||
+                    document.querySelector('div.ProseMirror[contenteditable="true"]');
+                if (!el) return;
+                el.focus();
+                try {
+                    document.execCommand('selectAll', false, null);
+                    document.execCommand('insertText', false, teks);
+                } catch (e) {
+                    el.textContent = teks;
+                    el.dispatchEvent(new InputEvent('input', { bubbles: true }));
+                }
+            }, promptTeks);
+            await page.waitForTimeout(400);
+        }
+
+        await pastikanNuxHilang(page, 'saat send');
+
+        // Pastikan teks masih di composer, lalu kirim — prioritaskan Enter (paling stabil di ChatGPT)
+        console.log(`[CHATGPT] 🚀 Mengirim tugas...`);
+        await page.evaluate((teks) => {
+            const el =
+                document.querySelector('#prompt-textarea') ||
+                document.querySelector('[data-testid="prompt-textarea"]') ||
+                document.querySelector('div.ProseMirror[contenteditable="true"]');
+            if (!el) return;
+            const cur = (el.innerText || el.textContent || el.value || '').trim();
+            if (cur.length >= 2) return;
+            el.focus();
+            try {
+                document.execCommand('selectAll', false, null);
+                document.execCommand('insertText', false, teks);
+            } catch (e) {
+                el.textContent = teks;
+                el.dispatchEvent(new InputEvent('input', { bubbles: true }));
+            }
+        }, promptTeks);
+        await page.waitForTimeout(300);
+
+        // Fokus composer + Enter (bukan hanya click send yang sering "palsu")
+        const box = page.locator(
+            '#prompt-textarea, [data-testid="prompt-textarea"], div.ProseMirror[contenteditable="true"]'
+        ).first();
+        await box.click({ timeout: 5000 }).catch(() => {});
+        await page.keyboard.press('Enter');
+        console.log('[CHATGPT] ⌨️ Enter di composer');
+
+        // Cadangan: klik send button jika Enter tidak memicu stop-button
+        await page.waitForTimeout(600);
+        const generating = await page.locator('[data-testid="stop-button"], .result-streaming').count().catch(() => 0);
+        if (!generating) {
+            console.log('[CHATGPT] ⚠️ Belum generating — coba klik send');
+            const sendLocators = [
+                page.locator('[data-testid="send-button"]'),
+                page.getByRole('button', { name: /send prompt|kirim perintah|^send$/i }),
+                page.locator('button[aria-label*="Send" i]'),
+                page.locator('button[aria-label*="Kirim" i]'),
+            ];
+            for (const loc of sendLocators) {
+                try {
+                    if (!(await loc.count())) continue;
+                    const btn = loc.first();
+                    if (!(await btn.isVisible().catch(() => false))) continue;
+                    await btn.click({ timeout: 3000, force: true });
+                    console.log('[CHATGPT] ✅ Send button clicked');
+                    break;
+                } catch (_) {}
+            }
+            // Enter sekali lagi
+            await box.click({ timeout: 2000 }).catch(() => {});
+            await page.keyboard.press('Enter');
+        }
+
+        await page.waitForTimeout(800);
+        await klikGotItJikaAda(page);
         await stepShot(page, folderHasil, '08_after_send');
+
+        // Verifikasi sudah kirim: stop-button / streaming / bubble baru
+        const sentOk = await page.evaluate(() => {
+            if (document.querySelector('[data-testid="stop-button"]')) return true;
+            if (document.querySelector('.result-streaming')) return true;
+            return false;
+        }).catch(() => false);
+        if (!sentOk) {
+            console.log('[CHATGPT] ⚠️ Belum terlihat generating setelah send — lanjut radar (mungkin lambat)');
+        } else {
+            console.log('[CHATGPT] ✅ Generasi terdeteksi setelah send');
+        }
 
         console.log('\n[CHATGPT] ⏳ Mulai radar pemantauan DOM...');
         let hasilEktraksi = null;
@@ -802,3 +891,4 @@ async function eksekusiChatGPT(tipeTugas, promptTeks, isThinkingMode, fileInputD
 }
 
 module.exports = { eksekusiChatGPT };
+s
