@@ -46,155 +46,287 @@ async function stepShot(page, folderHasil, label) {
 // =====================================================================
 // 👤 TUNGGU PROFIL SIAP (dari Script 2)
 // =====================================================================
-async function tungguProfilSiap(page, timeoutMs = 45000) {
-    console.log('[CHATGPT] 👤 Menunggu profil sidebar siap...');
+async function deteksiLoginAtauSignup(page) {
+    return page.evaluate(() => {
+        const texts = [];
+        document.querySelectorAll('button, a, [role="button"]').forEach((el) => {
+            const t = (el.innerText || el.textContent || el.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
+            if (t && t.length < 40) texts.push(t);
+        });
+        const body = (document.body && document.body.innerText) ? document.body.innerText.slice(0, 4000) : '';
+        const joined = texts.join(' | ').toLowerCase();
+        const bodyL = body.toLowerCase();
+
+        const patterns = [
+            /^log\s*in$/i,
+            /^sign\s*up$/i,
+            /^sign\s*up\s*\/?\s*log\s*in$/i,
+            /^create\s*account$/i,
+            /^masuk$/i,
+            /^daftar$/i,
+            /^log\s*in\s*\/\s*sign\s*up$/i,
+        ];
+        for (const t of texts) {
+            for (const re of patterns) {
+                if (re.test(t.trim())) return { hit: true, via: 'btn:' + t };
+            }
+        }
+        // Auth wall umum di chatgpt.com
+        if (/log in or sign up/i.test(body) || /welcome to chatgpt/i.test(body) && /log in/i.test(body)) {
+            return { hit: true, via: 'body-auth-wall' };
+        }
+        // data-testid auth
+        if (document.querySelector('[data-testid="login-button"], [data-testid="signup-button"]')) {
+            return { hit: true, via: 'testid-auth' };
+        }
+        return { hit: false, via: '' };
+    });
+}
+
+/**
+ * Validasi sesi cookie: BUKAN lewat profil.
+ * - Ada Login/Sign up → cookie invalid → throw COOKIE_INVALID
+ * - Composer siap / tidak ada auth wall → lanjut
+ */
+async function tungguSesiValid(page, timeoutMs = 45000) {
+    console.log('[CHATGPT] 🔐 Cek sesi (login/signup = cookie invalid)...');
     const t0 = Date.now();
-    let ok = false;
     let lastLog = 0;
 
     while (Date.now() - t0 < timeoutMs) {
-        const info = await page.evaluate(() => {
-            const btn = document.querySelector('[data-testid="accounts-profile-button"]');
-            const img = btn && (
-                btn.querySelector('img[alt="Profile image"]') ||
-                btn.querySelector('img[src*="auth0.com/avatars"]') ||
-                btn.querySelector('img[src^="http"]')
-            );
-            const src = img ? (img.getAttribute('src') || img.currentSrc || '') : '';
-            const aria = btn ? (btn.getAttribute('aria-label') || '') : '';
-
-            let sidebarName = '';
-            const upgradeBtn = Array.from(document.querySelectorAll('button, a, span')).find((el) =>
-                /^(Upgrade|Tingkatkan)$/i.test((el.textContent || '').trim())
-            );
-            if (upgradeBtn) {
-                let root = upgradeBtn.closest('div');
-                for (let i = 0; i < 6 && root; i++) {
-                    const t = (root.innerText || '').replace(/\s+/g, ' ').trim();
-                    if (/\b(Free|Plus|Pro|Team|Bebas)\b/i.test(t) && t.length < 80) {
-                        sidebarName = t;
-                        break;
-                    }
-                    root = root.parentElement;
-                }
-            }
-
-            const ariaHasName =
-                aria &&
-                !/^(open profile menu|buka menu profil)$/i.test(aria.trim()) &&
-                aria.trim().length > 5;
-
-            return {
-                hasBtn: !!btn,
-                hasImg: !!(src && src.startsWith('http')),
-                src: src.slice(0, 90),
-                aria: aria.slice(0, 80),
-                sidebarName: sidebarName.slice(0, 80),
-                ariaHasName,
-            };
-        });
-
-        if (info.hasImg) {
-            ok = true;
-            console.log(`[CHATGPT] ✅ Profil via foto ${Date.now() - t0}ms`);
-            break;
+        const auth = await deteksiLoginAtauSignup(page);
+        if (auth.hit) {
+            console.log(`[CHATGPT] ❌ Auth wall: ${auth.via}`);
+            throw new Error('COOKIE_INVALID: terdeteksi tombol/halaman Login atau Sign up (' + auth.via + ')');
         }
-        if (info.ariaHasName) {
-            ok = true;
-            console.log(`[CHATGPT] ✅ Profil via aria ${Date.now() - t0}ms`);
-            break;
-        }
-        if (info.sidebarName && /\b(Free|Plus|Pro|Team|Bebas)\b/i.test(info.sidebarName)) {
-            const cleaned = info.sidebarName
-                .replace(/\b(Free|Plus|Pro|Team|Bebas|Upgrade|Tingkatkan)\b/gi, '')
-                .replace(/\s+/g, ' ')
-                .trim();
-            if (cleaned.length >= 2) {
-                ok = true;
-                console.log(`[CHATGPT] ✅ Profil via sidebar ${Date.now() - t0}ms`);
-                break;
+
+        // Composer muncul = sesi cukup untuk lanjut (tanpa wajib profil)
+        const composer = await page.evaluate(() => {
+            const a = document.querySelector('#prompt-textarea');
+            if (a) {
+                const st = window.getComputedStyle(a);
+                if (st && st.display !== 'none' && st.visibility !== 'hidden') return true;
             }
+            return !!(
+                document.querySelector('[data-testid="prompt-textarea"]') ||
+                document.querySelector('div.ProseMirror[contenteditable="true"]')
+            );
+        }).catch(() => false);
+
+        if (composer) {
+            console.log(`[CHATGPT] ✅ Sesi OK (composer ada, tanpa login wall) ${Date.now() - t0}ms`);
+            return;
         }
 
         if (Date.now() - lastLog > 2500) {
             lastLog = Date.now();
-            console.log(`[CHATGPT] profil… ${Date.now() - t0}ms`);
+            console.log(`[CHATGPT] sesi… ${Date.now() - t0}ms (tunggu composer / cek auth)`);
         }
-        await page.waitForTimeout(300);
+        await page.waitForTimeout(400);
     }
 
-    if (!ok) {
-        console.log(`[CHATGPT] ❌ Timeout profil ${timeoutMs}ms — hentikan`);
-        throw new Error('PROFIL_TIMEOUT: Profil sidebar tidak terdeteksi dalam ' + timeoutMs + 'ms. Cookie/sesi mungkin invalid.');
+    // Timeout: cek auth sekali lagi
+    const auth2 = await deteksiLoginAtauSignup(page);
+    if (auth2.hit) {
+        throw new Error('COOKIE_INVALID: terdeteksi Login/Sign up (' + auth2.via + ')');
     }
+    // Tidak ada auth wall — biarkan tungguComposerSiap yang memutuskan
+    console.log('[CHATGPT] ⚠️ Timeout cek sesi tanpa auth wall — lanjut ke composer');
+}
+
+/** Klik nyata di area kosong (pinggir kanan tengah / bawah tengah) untuk menutup NUX/overlay */
+async function klikAreaKosong(page) {
+    try {
+        const vp = page.viewportSize() || { width: 1920, height: 1080 };
+        // Tengah-kanan (bukan di atas dialog tengah)
+        const x1 = Math.floor(vp.width * 0.92);
+        const y1 = Math.floor(vp.height * 0.50);
+        // Bawah-tengah
+        const x2 = Math.floor(vp.width * 0.50);
+        const y2 = Math.floor(vp.height * 0.92);
+
+        await page.mouse.click(x1, y1, { delay: 40 });
+        await page.waitForTimeout(120);
+        await page.mouse.click(x2, y2, { delay: 40 });
+        await page.waitForTimeout(150);
+    } catch (_) {}
 }
 
 // =====================================================================
 // ⏳ TUNGGU COMPOSER SIAP (dari Script 2)
 // =====================================================================
+/** Cari elemen composer di semua varian UI ChatGPT */
+function composerFinderScript() {
+    return (() => {
+        const visible = (el) => {
+            if (!el) return false;
+            const st = window.getComputedStyle(el);
+            if (!st || st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0') return false;
+            const r = el.getBoundingClientRect();
+            return r.width > 20 && r.height > 10;
+        };
+        const candidates = [];
+        const push = (el, how) => { if (el && visible(el)) candidates.push({ el, how }); };
+
+        push(document.querySelector('#prompt-textarea'), 'id');
+        push(document.querySelector('[data-testid="prompt-textarea"]'), 'testid');
+        document.querySelectorAll('div.ProseMirror[contenteditable="true"], [contenteditable="true"].ProseMirror').forEach((el) => push(el, 'prose'));
+        // UI penuh: placeholder "Ask ChatGPT" / "Tanyakan apa saja" — contenteditable di form utama
+        document.querySelectorAll('[contenteditable="true"]').forEach((el) => {
+            const ph = (el.getAttribute('data-placeholder') || el.getAttribute('aria-placeholder') || el.getAttribute('placeholder') || '').toLowerCase();
+            const al = (el.getAttribute('aria-label') || '').toLowerCase();
+            if (/ask chatgpt|tanyakan|message|pesan|prompt/i.test(ph + ' ' + al)) push(el, 'ph');
+            else if (visible(el) && el.closest('form')) push(el, 'form-ce');
+        });
+        // textarea biasa
+        document.querySelectorAll('textarea').forEach((el) => {
+            const ph = (el.getAttribute('placeholder') || '').toLowerCase();
+            if (/ask|tanya|message|chatgpt/i.test(ph) || el.id === 'prompt-textarea') push(el, 'textarea');
+        });
+
+        if (!candidates.length) return null;
+        // prioritaskan yang di tengah bawah viewport (composer utama)
+        candidates.sort((a, b) => {
+            const rb = b.el.getBoundingClientRect();
+            const ra = a.el.getBoundingClientRect();
+            return (rb.y + rb.height) - (ra.y + ra.height);
+        });
+        return candidates[0].how;
+    })();
+}
+
 async function tungguComposerSiap(page, timeoutMs = 60000) {
     console.log('[CHATGPT] ⏳ Menunggu kolom teks (composer) siap...');
     await page.waitForFunction(() => {
-        const a = document.querySelector('#prompt-textarea');
-        if (a) {
-            const st = window.getComputedStyle(a);
-            if (st && st.display !== 'none' && st.visibility !== 'hidden') return true;
+        const visible = (el) => {
+            if (!el) return false;
+            const st = window.getComputedStyle(el);
+            if (!st || st.display === 'none' || st.visibility === 'hidden') return false;
+            const r = el.getBoundingClientRect();
+            return r.width > 20 && r.height > 10;
+        };
+        if (visible(document.querySelector('#prompt-textarea'))) return true;
+        if (visible(document.querySelector('[data-testid="prompt-textarea"]'))) return true;
+        if (document.querySelector('div.ProseMirror[contenteditable="true"]')) return true;
+        for (const el of document.querySelectorAll('[contenteditable="true"]')) {
+            if (!visible(el)) continue;
+            const ph = (el.getAttribute('data-placeholder') || el.getAttribute('aria-label') || '').toLowerCase();
+            if (/ask|tanya|message|chatgpt|prompt/i.test(ph) || el.closest('form')) return true;
         }
-        const b = document.querySelector('[data-testid="prompt-textarea"]');
-        if (b) return true;
-        const c = document.querySelector('div.ProseMirror[contenteditable="true"], [contenteditable="true"].ProseMirror');
-        if (c) return true;
-        const send = document.querySelector('[data-testid="send-button"]');
-        if (send) {
-            const form = send.closest('form') || send.closest('div');
-            if (form && form.querySelector('[contenteditable="true"]')) return true;
+        for (const el of document.querySelectorAll('textarea')) {
+            if (visible(el)) return true;
+        }
+        // UI "Ask ChatGPT" pill: ada tombol mic/send di bar yang sama
+        if (document.querySelector('[data-testid="send-button"], button[aria-label*="Send" i], button[aria-label*="Kirim" i]')) {
+            if (document.querySelector('[contenteditable="true"], textarea')) return true;
         }
         return false;
     }, { timeout: timeoutMs });
     console.log('[CHATGPT] ✅ Composer siap');
 }
 
+async function suntikPromptKeComposer(page, promptTeks) {
+    // Klik nyata ke area composer dulu (aktifkan focus di UI penuh)
+    const clicked = await page.evaluate(() => {
+        const visible = (el) => {
+            if (!el) return false;
+            const st = window.getComputedStyle(el);
+            if (!st || st.display === 'none' || st.visibility === 'hidden') return false;
+            const r = el.getBoundingClientRect();
+            return r.width > 20 && r.height > 10;
+        };
+        const list = [];
+        const add = (el) => { if (visible(el)) list.push(el); };
+        add(document.querySelector('#prompt-textarea'));
+        add(document.querySelector('[data-testid="prompt-textarea"]'));
+        document.querySelectorAll('div.ProseMirror[contenteditable="true"], [contenteditable="true"]').forEach(add);
+        document.querySelectorAll('textarea').forEach(add);
+        if (!list.length) return null;
+        list.sort((a, b) => b.getBoundingClientRect().y - a.getBoundingClientRect().y);
+        const el = list[0];
+        const r = el.getBoundingClientRect();
+        return { x: r.x + r.width / 2, y: r.y + Math.min(r.height / 2, 24) };
+    });
+
+    if (clicked) {
+        await page.mouse.click(clicked.x, clicked.y, { delay: 30 });
+        await page.waitForTimeout(150);
+    }
+
+    const ok = await page.evaluate((teks) => {
+        const visible = (el) => {
+            if (!el) return false;
+            const st = window.getComputedStyle(el);
+            if (!st || st.display === 'none' || st.visibility === 'hidden') return false;
+            const r = el.getBoundingClientRect();
+            return r.width > 20 && r.height > 10;
+        };
+        const list = [];
+        const add = (el) => { if (visible(el)) list.push(el); };
+        add(document.querySelector('#prompt-textarea'));
+        add(document.querySelector('[data-testid="prompt-textarea"]'));
+        document.querySelectorAll('div.ProseMirror[contenteditable="true"], [contenteditable="true"]').forEach(add);
+        document.querySelectorAll('textarea').forEach(add);
+        if (!list.length) return false;
+        list.sort((a, b) => b.getBoundingClientRect().y - a.getBoundingClientRect().y);
+        const el = list[0];
+        el.focus();
+        try {
+            document.execCommand('selectAll', false, null);
+            document.execCommand('insertText', false, teks);
+        } catch (e) {
+            if (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT') {
+                el.value = teks;
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+            } else {
+                el.textContent = teks;
+                el.dispatchEvent(new InputEvent('input', { bubbles: true, data: teks }));
+            }
+        }
+        return (el.innerText || el.textContent || el.value || '').trim().length > 0;
+    }, promptTeks);
+
+    if (!ok) {
+        // Fallback keyboard type
+        await page.keyboard.type(promptTeks, { delay: 8 });
+    }
+    return true;
+}
+
+async function klikSendAtauEnter(page) {
+    // 1) Enter di composer
+    await page.keyboard.press('Enter');
+    await page.waitForTimeout(500);
+    let gen = await page.locator('[data-testid="stop-button"], .result-streaming').count().catch(() => 0);
+    if (gen) return 'enter';
+
+    // 2) Klik send berbagai selector
+    const locs = [
+        page.locator('[data-testid="send-button"]'),
+        page.getByRole('button', { name: /send prompt|kirim perintah|^send$|^kirim$/i }),
+        page.locator('button[aria-label*="Send" i]'),
+        page.locator('button[aria-label*="Kirim" i]'),
+    ];
+    for (const loc of locs) {
+        try {
+            if (!(await loc.count())) continue;
+            const btn = loc.first();
+            if (!(await btn.isVisible().catch(() => false))) continue;
+            await btn.click({ timeout: 2500, force: true });
+            await page.waitForTimeout(400);
+            gen = await page.locator('[data-testid="stop-button"], .result-streaming').count().catch(() => 0);
+            if (gen) return 'click';
+        } catch (_) {}
+    }
+
+    // 3) Enter sekali lagi
+    await page.keyboard.press('Enter');
+    return 'enter-retry';
+}
+
 // =====================================================================
 // 🧹 NUX memory (Got it / Mengerti) — minimal, tidak mengganggu composer
-// =====================================================================
-async function dismissNuxIfOpen(page) {
-    try {
-        const open = await page.locator(
-            '#modal-m3m-nux [data-state="open"], [data-testid="modal-m3m-nux"] [data-state="open"]'
-        ).count();
-        if (!open) return false;
 
-        const btn = page.locator(
-            '#modal-m3m-nux button.btn-primary, [data-testid="modal-m3m-nux"] button.btn-primary'
-        ).filter({ hasText: /^(Got it|Mengerti)$/i }).first();
-
-        if (await btn.count()) {
-            await btn.click({ timeout: 2000, force: true }).catch(() => {});
-            await page.waitForTimeout(300);
-        }
-
-        // Jika masih ada, hapus node modal saja (jangan sentuh body/composer)
-        const still = await page.locator(
-            '#modal-m3m-nux [data-state="open"], [data-testid="modal-m3m-nux"] [data-state="open"]'
-        ).count();
-        if (still) {
-            await page.evaluate(() => {
-                const w = document.getElementById('modal-m3m-nux') ||
-                    document.querySelector('[data-testid="modal-m3m-nux"]');
-                if (w) w.remove();
-                document.body.removeAttribute('data-scroll-locked');
-                if (document.body.style.pointerEvents === 'none') {
-                    document.body.style.pointerEvents = '';
-                }
-            }).catch(() => {});
-            await page.waitForTimeout(200);
-        }
-        console.log('[CHATGPT] 🧹 NUX dismissed');
-        return true;
-    } catch (_) {
-        return false;
-    }
-}
 
 // =====================================================================
 // 🚀 EKSEKUTOR UTAMA CHATGPT (HIBRIDA MURNI)
@@ -267,19 +399,23 @@ async function eksekusiChatGPT(tipeTugas, promptTeks, isThinkingMode, fileInputD
         await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
         await stepShot(page, folderHasil, '01_after_goto');
 
-        // ---------------------------------------------------------
-        // 2) Tunggu profil (dari Local)
-        // ---------------------------------------------------------
-        await tungguProfilSiap(page, 45000);
-        await stepShot(page, folderHasil, '02_after_profile');
-        await dismissNuxIfOpen(page);
+        // Klik nyata di area kosong — tutup NUX/overlay tanpa deteksi
+        await klikAreaKosong(page);
 
         // ---------------------------------------------------------
-        // 3) Tunggu composer (dari Local)
+        // 2) Validasi cookie: Login/Sign up = invalid
+        // ---------------------------------------------------------
+        await tungguSesiValid(page, 45000);
+        await stepShot(page, folderHasil, '02_after_session');
+        await klikAreaKosong(page);
+
+        // ---------------------------------------------------------
+        // 3) Composer siap → baru ketik prompt
         // ---------------------------------------------------------
         await tungguComposerSiap(page, 60000);
         await stepShot(page, folderHasil, '03_composer_ready');
-        await page.waitForTimeout(800);
+        await klikAreaKosong(page);
+        await page.waitForTimeout(400);
 
         if (isThinkingMode) {
             console.log(`[CHATGPT] 🧠 Mengaktifkan Thinking Mode...`);
@@ -513,30 +649,15 @@ async function eksekusiChatGPT(tipeTugas, promptTeks, isThinkingMode, fileInputD
             };
         });
 
-        await dismissNuxIfOpen(page);
+        await klikAreaKosong(page);
         console.log(`[CHATGPT] ⚡ Menyuntikkan Prompt...`);
-        const textarea = page.locator('#prompt-textarea');
-        await textarea.focus();
-        await page.evaluate((teks) => { 
-            const inputBox = document.querySelector('#prompt-textarea'); 
-            if(inputBox) document.execCommand('insertText', false, teks);
-        }, promptTeks);
-        
-        await page.waitForTimeout(1000);
+        await suntikPromptKeComposer(page, promptTeks);
+        await page.waitForTimeout(500);
 
-        console.log(`[CHATGPT] ⏳ Menunggu tombol Send siap...`);
-        await page.waitForFunction(() => {
-            const sendBtn = document.querySelector('[data-testid="send-button"]');
-            if (!sendBtn) return false;
-            return !(sendBtn.disabled || sendBtn.hasAttribute('disabled') || sendBtn.getAttribute('aria-disabled') === 'true'); 
-        }, { timeout: 120000 }).catch(()=>{}); 
-
-        await dismissNuxIfOpen(page);
-        console.log(`[CHATGPT] 🚀 Tombol Send siap! Mengirim tugas...`);
-        await page.evaluate(() => { 
-            const sendBtn = document.querySelector('[data-testid="send-button"]'); 
-            if (sendBtn) sendBtn.click(); 
-        });
+        await klikAreaKosong(page);
+        console.log(`[CHATGPT] 🚀 Mengirim tugas...`);
+        const how = await klikSendAtauEnter(page);
+        console.log(`[CHATGPT] 📤 Send method: ${how}`);
         await stepShot(page, folderHasil, '08_after_send');
 
         console.log('\n[CHATGPT] ⏳ Mulai radar pemantauan DOM...');
