@@ -436,6 +436,92 @@ async function klikSendAtauEnter(page) {
     return 'enter';
 }
 
+// Gambar hasil ChatGPT sekarang src="blob:...". Firefox menolak
+// String.fromCharCode.apply (Permission denied to access property constructor).
+// Utama: klik tombol Download yang sudah ada di galeri.
+async function simpanGambarHasil(page, folderHasil, context, imgUrl, index) {
+    const stem = `chatgpt_IMG_${Date.now()}_${index + 1}`;
+    const destPng = path.join(folderHasil, `${stem}.png`);
+    const destWebp = path.join(folderHasil, `${stem}.webp`);
+    const cukup = (p) => {
+        try { return fs.existsSync(p) && fs.statSync(p).size > 800; } catch (e) { return false; }
+    };
+
+    try {
+        const galeri = page.locator('[data-testid="generated-image-gallery"]').last();
+        const gambar = (await galeri.count().catch(() => 0))
+            ? galeri.locator('img').last()
+            : page.locator('img[alt="Generated image"]').last();
+        await gambar.scrollIntoViewIfNeeded().catch(() => {});
+        await gambar.hover({ timeout: 4000 }).catch(() => {});
+        await page.waitForTimeout(250);
+        const tombol = page.locator(
+            'button[data-testid="image-action-download-button"], button[aria-label="Download"]'
+        ).last();
+        const [download] = await Promise.all([
+            page.waitForEvent('download', { timeout: 20000 }),
+            tombol.click({ force: true, timeout: 5000 })
+        ]);
+        const ext = path.extname(download.suggestedFilename() || '').toLowerCase();
+        const dest = ['.png', '.jpg', '.jpeg', '.webp', '.gif'].includes(ext)
+            ? path.join(folderHasil, `${stem}${ext}`)
+            : destPng;
+        await download.saveAs(dest);
+        if (cukup(dest)) {
+            console.log(`[CHATGPT] âœ… Gambar via tombol Download (${fs.statSync(dest).size} B)`);
+            return path.basename(dest);
+        }
+    } catch (e) {
+        console.log(`[CHATGPT] âš ï¸ Tombol Download: ${e.message}`);
+    }
+
+    if (imgUrl && /^https?:/i.test(imgUrl)) {
+        try {
+            await sedotNative(imgUrl, destWebp, context);
+            if (cukup(destWebp)) return path.basename(destWebp);
+        } catch (e) {
+            console.log(`[CHATGPT] âš ï¸ sedotNative: ${e.message}`);
+        }
+    }
+
+    if (imgUrl && /^blob:/i.test(imgUrl)) {
+        try {
+            const dataUrl = await page.evaluate(async (u) => {
+                const r = await fetch(u);
+                const blob = await r.blob();
+                return await new Promise((resolve, reject) => {
+                    const fr = new FileReader();
+                    fr.onload = () => resolve(typeof fr.result === 'string' ? fr.result : '');
+                    fr.onerror = () => reject(new Error('FileReader'));
+                    fr.readAsDataURL(blob);
+                });
+            }, imgUrl);
+            const m = String(dataUrl || '').match(/^data:[^;]+;base64,(.+)$/);
+            if (m && m[1]) {
+                fs.writeFileSync(destPng, Buffer.from(m[1], 'base64'));
+                if (cukup(destPng)) {
+                    console.log('[CHATGPT] âœ… Gambar via blob FileReader');
+                    return path.basename(destPng);
+                }
+            }
+        } catch (e) {
+            console.log(`[CHATGPT] âš ï¸ blob FileReader: ${e.message}`);
+        }
+    }
+
+    try {
+        const gambar = page.locator('[data-testid="generated-image-gallery"] img, img[alt="Generated image"]').last();
+        await gambar.screenshot({ path: destPng });
+        if (cukup(destPng)) {
+            console.log('[CHATGPT] âœ… Gambar via screenshot elemen');
+            return path.basename(destPng);
+        }
+    } catch (e) {
+        console.log(`[CHATGPT] âš ï¸ screenshot elemen: ${e.message}`);
+    }
+    return null;
+}
+
 // =====================================================================
 // ðŸ§¹ NUX memory (Got it / Mengerti) â€” minimal, tidak mengganggu composer
 
@@ -718,7 +804,11 @@ async function eksekusiChatGPT(tipeTugas, promptTeks, isThinkingMode, fileInputD
                 } catch (e) { console.log(`[CHATGPT] âŒ Error Gambar: ${e.message}`); }
             }
 
-            // Pantau lampiran (dari Script 2)
+            // Setelah unggah: suntik prompt dulu, tunggu lampiran terlihat, lalu kirim.
+            // Tidak ada tunggu "stabilitas upload" 120 detik.
+            console.log(`[CHATGPT] âš¡ Menyuntikkan Prompt...`);
+            await suntikPromptKeComposer(page, promptTeks);
+
             console.log(`[CHATGPT] â³ Menunggu visualisasi file di layar...`);
             try {
                 await page.waitForFunction((expected) => {
@@ -751,31 +841,19 @@ async function eksekusiChatGPT(tipeTugas, promptTeks, isThinkingMode, fileInputD
                 await stepShot(page, folderHasil, '04_attachment_timeout');
             }
 
-            // Stabilitas upload
-            try {
-                await page.waitForFunction(() => {
-                    const nodes = Array.from(document.querySelectorAll('div, span, p'));
-                    for (const n of nodes) {
-                        const t = (n.textContent || '').trim();
-                        if (/^Uploading(\.\.\.|â€¦)?$/i.test(t)) return false;
-                        if (/^Uploading file/i.test(t) && !/Try using connectors/i.test(t)) return false;
-                    }
-                    if (document.querySelector('[data-testid*="upload-progress"]')) return false;
-                    const sendBtn = document.querySelector('[data-testid="send-button"]');
-                    if (!sendBtn) return false;
-                    return !(sendBtn.disabled || sendBtn.hasAttribute('disabled') || sendBtn.getAttribute('aria-disabled') === 'true');
-                }, { timeout: 120000 });
-                console.log('[CHATGPT] âœ… Upload stabil');
-            } catch (e) {
-                console.log('[CHATGPT] âš ï¸ Timeout stabilitas upload');
+            const tungguKirim = Date.now();
+            while (Date.now() - tungguKirim < 15000) {
+                const st = await bacaStatusTombolComposer(page);
+                if (st.status === 'send_ready') break;
+                await page.waitForTimeout(400);
             }
-            await page.waitForTimeout(1000);
         }
 
 
-        // JANGAN klikAreaKosong di antara suntik dan send â€” itu menghilangkan fokus composer
-        console.log(`[CHATGPT] âš¡ Menyuntikkan Prompt...`);
-        await suntikPromptKeComposer(page, promptTeks);
+        if (!validFiles.length) {
+            console.log(`[CHATGPT] âš¡ Menyuntikkan Prompt...`);
+            await suntikPromptKeComposer(page, promptTeks);
+        }
         await page.waitForTimeout(400);
 
         const sinyalSebelumKirim = await bacaStatusTombolComposer(page);
@@ -977,7 +1055,7 @@ async function eksekusiChatGPT(tipeTugas, promptTeks, isThinkingMode, fileInputD
                 let extracted = extractAssistantText();
                 if (!extracted.text) {
                     const vis = textAfterPrompt();
-                    const bersih = vis.split('\n').map((line) => line.trim()).filter((line) => {
+                    const bersih = vis.split('\n').map((s) => s.trim()).filter((line) => {
                         if (!line) return false;
                         if (line === (prompt || '').trim()) return false;
                         if (/^(edit|chatgpt said:?|you said:?|salin respons|copy|bagikan|share)$/i.test(line)) return false;
@@ -1079,31 +1157,17 @@ async function eksekusiChatGPT(tipeTugas, promptTeks, isThinkingMode, fileInputD
         if (hasilEktraksi.images && hasilEktraksi.images.length > 0) {
             console.log(`\n[CHATGPT] âœ… Mengunduh ${hasilEktraksi.images.length} gambar buatan AI...`);
             for (let i = 0; i < hasilEktraksi.images.length; i++) {
-                const imgUrl = hasilEktraksi.images[i];
-                const fileName = `chatgpt_IMG_${Date.now()}_${i + 1}.webp`;
-                const dest = path.join(folderHasil, fileName);
-                try {
-                    if (/^blob:|^data:/i.test(imgUrl)) {
-                        const b64 = await page.evaluate(async (u) => {
-                            const r = await fetch(u);
-                            const buf = await r.arrayBuffer();
-                            const bytes = new Uint8Array(buf);
-                            let bin = '';
-                            for (let n = 0; n < bytes.length; n += 0x8000) {
-                                bin += String.fromCharCode.apply(null, bytes.subarray(n, n + 0x8000));
-                            }
-                            return btoa(bin);
-                        }, imgUrl);
-                        fs.writeFileSync(dest, Buffer.from(b64, 'base64'));
-                    } else {
-                        await sedotNative(imgUrl, dest, context);
-                    }
-                    if (fs.existsSync(dest) && fs.statSync(dest).size > 0) fileTersimpanArray.push(fileName);
-                } catch (e) {
-                    console.log(`[CHATGPT] âš ï¸ Gagal unduh gambar: ${e.message}`);
-                }
+                const nama = await simpanGambarHasil(page, folderHasil, context, hasilEktraksi.images[i], i);
+                if (nama) fileTersimpanArray.push(nama);
             }
-        } 
+        }
+
+        if (tipeTugas === 'GAMBAR') {
+            if (!fileTersimpanArray.length) {
+                throw new Error('GAMBAR: hasil gambar tidak tersimpan');
+            }
+            return { text: '', files: fileTersimpanArray };
+        }
 
         return { text: hasilEktraksi.text, files: fileTersimpanArray };
 
