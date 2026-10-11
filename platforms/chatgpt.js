@@ -338,8 +338,10 @@ async function bacaStatusTombolComposer(page) {
             !isStop(x) && (
                 x.testid === 'send-button' ||
                 /^kirim perintah$/i.test(x.aria) ||
+                /^kirim$/i.test(x.aria) ||
                 /^send prompt$/i.test(x.aria) ||
-                /^send$/i.test(x.aria)
+                /^send$/i.test(x.aria) ||
+                /^send message$/i.test(x.aria)
             );
         const isVoice = (x) =>
             /^mulai suara$/i.test(x.aria) ||
@@ -375,51 +377,37 @@ async function bacaStatusTombolComposer(page) {
 }
 
 async function klikSendAtauEnter(page) {
-    const sedangKerja = async () => {
-        const s = await bacaStatusTombolComposer(page);
-        return s.status === 'processing' || s.status === 'uploading';
-    };
-
-    // Klik nyata tombol Kirim / Send yang terlihat Ã¢â‚¬â€ bukan Enter dulu
     const sels = [
-        '#composer-submit-button[data-testid="send-button"]',
-        'button[data-testid="send-button"]',
-        '#composer-submit-button[aria-label="Kirim perintah"]',
+        'button[type="submit"][aria-label="Kirim"]',
+        'button[aria-label="Kirim"]',
         'button[aria-label="Kirim perintah"]',
+        'button[data-testid="send-button"]',
+        '#composer-submit-button[data-testid="send-button"]',
+        'button[aria-label="Send"]',
         'button[aria-label="Send prompt"]',
-        'button[aria-label="Send"]'
+        'button[aria-label="Send message"]'
     ];
     for (const sel of sels) {
         try {
-            const loc = page.locator(sel);
-            if (!(await loc.count())) continue;
-            const btn = loc.first();
-            if (!(await btn.isVisible().catch(() => false))) continue;
-            await btn.click({ timeout: 4000, force: true });
-            await page.waitForTimeout(700);
-            if (await sedangKerja()) return 'click:' + sel;
-            const st = await bacaStatusTombolComposer(page);
-            // Sudah selesai kilat: suara kembali, atau tombol kirim hilang
-            if (st.status === 'idle' || st.status === 'unknown') return 'click:' + sel;
+            const loc = page.locator(sel).last();
+            if (!(await loc.count().catch(() => 0))) continue;
+            await loc.click({ timeout: 3000, force: true });
+            await page.waitForTimeout(450);
+            return 'click:' + sel;
         } catch (_) {}
     }
 
     const evalClick = await page.evaluate(() => {
-        const terlihat = (el) => {
-            if (!el || el.closest('[hidden]')) return false;
-            const r = el.getBoundingClientRect();
-            if (r.width < 4 || r.height < 4) return false;
-            const cs = window.getComputedStyle(el);
-            return cs.display !== 'none' && cs.visibility !== 'hidden';
-        };
-        const buttons = Array.from(document.querySelectorAll('button')).filter(terlihat);
+        const buttons = Array.from(document.querySelectorAll('button'));
         const btn = buttons.find((b) => {
             const testid = b.getAttribute('data-testid') || '';
             const aria = (b.getAttribute('aria-label') || '').trim();
             if (testid === 'stop-button') return false;
             return testid === 'send-button' ||
+                aria === 'Kirim' ||
                 aria === 'Kirim perintah' ||
                 aria === 'Send prompt' ||
+                aria === 'Send message' ||
                 aria === 'Send';
         });
         if (!btn) return false;
@@ -427,13 +415,30 @@ async function klikSendAtauEnter(page) {
         return true;
     }).catch(() => false);
     if (evalClick) {
-        await page.waitForTimeout(700);
-        if (await sedangKerja()) return 'eval-click';
+        await page.waitForTimeout(450);
+        return 'eval-click';
     }
 
     await page.keyboard.press('Enter');
-    await page.waitForTimeout(500);
+    await page.waitForTimeout(400);
     return 'enter';
+}
+
+async function kirimTerkonfirmasi(page, promptTeks) {
+    const cup = (promptTeks || '').trim().slice(0, 48);
+    const t0 = Date.now();
+    while (Date.now() - t0 < 5000) {
+        const st = await bacaStatusTombolComposer(page);
+        if (st.status === 'processing' || st.status === 'uploading' || st.stop) return true;
+        const masihDiKolom = await page.evaluate((cuplikan) => {
+            if (!cuplikan) return false;
+            const nodes = Array.from(document.querySelectorAll('#prompt-textarea, textarea, [contenteditable="true"]'));
+            return nodes.some((el) => ((el.innerText || el.value || '').trim()).includes(cuplikan));
+        }, cup).catch(() => false);
+        if (!masihDiKolom && st.status !== 'send_ready') return true;
+        await page.waitForTimeout(400);
+    }
+    return false;
 }
 
 // =====================================================================
@@ -545,6 +550,17 @@ async function eksekusiChatGPT(tipeTugas, promptTeks, isThinkingMode, fileInputD
             await page.waitForTimeout(300);
         }
 
+        let copyAwal = 0;
+        let terkirim = false;
+        for (let upayaKirim = 1; upayaKirim <= 2 && !terkirim; upayaKirim++) {
+        if (upayaKirim > 1) {
+            console.log('[CHATGPT] Prompt masih di kolom. Refresh halaman lalu ulang proses...');
+            await page.reload({ waitUntil: 'domcontentloaded', timeout: 60000 });
+            await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
+            await klikAreaKosong(page);
+            await tungguComposerSiap(page, 30000);
+        }
+
         if (isThinkingMode) {
             console.log(`[CHATGPT] Ã°Å¸Â§  Mengaktifkan Thinking Mode...`);
             await page.keyboard.press('Control+Shift+M');
@@ -572,33 +588,10 @@ async function eksekusiChatGPT(tipeTugas, promptTeks, isThinkingMode, fileInputD
                     break;
                 }
                 if (!plusTerbuka) throw new Error('tombol plus/add-context tidak ketemu');
-                await page.waitForTimeout(900);
-
-                const imgMenuBox = await page.evaluate(() => {
-                    const terlihat = (el) => {
-                        if (!el || el.closest('nav, aside, a[href^="/c/"]')) return false;
-                        const r = el.getBoundingClientRect();
-                        if (r.width < 8 || r.height < 8) return false;
-                        const cs = window.getComputedStyle(el);
-                        return cs.display !== 'none' && cs.visibility !== 'hidden';
-                    };
-                    const nodes = Array.from(document.querySelectorAll('[role="menuitem"], [role="option"], .__menu-item, span, div, button'));
-                    for (const el of nodes) {
-                        const t = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
-                        if (t !== 'create image' && t !== 'buat gambar') continue;
-                        if (!terlihat(el)) continue;
-                        const clickable = el.closest('[role="menuitem"], [role="option"], .__menu-item, button, div[tabindex="0"]') || el;
-                        const rect = clickable.getBoundingClientRect();
-                        return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2, t };
-                    }
-                    return null;
-                });
-
-                if (!imgMenuBox) throw new Error('menu Create image / Buat gambar tidak ketemu');
-                await page.mouse.move(imgMenuBox.x, imgMenuBox.y, { steps: 5 });
-                await page.waitForTimeout(150);
-                await page.mouse.click(imgMenuBox.x, imgMenuBox.y);
-                console.log(`[CHATGPT] Ã°Å¸Å½Â¨ Mode gambar diklik: ${imgMenuBox.t}`);
+                const menu = page.locator('button[data-list-navigation-item="true"], [role="menuitem"]').filter({ hasText: /buat gambar|create image/i }).first();
+                await menu.waitFor({ state: 'attached', timeout: 8000 });
+                await menu.click({ force: true, timeout: 4000 });
+                console.log('[CHATGPT] Mode gambar diklik: Buat gambar');
                 await page.waitForTimeout(800);
             } catch (err) {
                 console.log(`[CHATGPT] Ã¢Å¡ Ã¯Â¸Â Peringatan aktivasi mode gambar: ${err.message}`);
@@ -761,7 +754,7 @@ async function eksekusiChatGPT(tipeTugas, promptTeks, isThinkingMode, fileInputD
                         if (/^Uploading file/i.test(t) && !/Try using connectors/i.test(t)) return false;
                     }
                     if (document.querySelector('[data-testid*="upload-progress"]')) return false;
-                    const sendBtn = document.querySelector('[data-testid="send-button"]');
+                    const sendBtn = document.querySelector('button[aria-label="Kirim"], button[aria-label="Kirim perintah"], button[aria-label="Send"], [data-testid="send-button"]');
                     if (!sendBtn) return false;
                     return !(sendBtn.disabled || sendBtn.hasAttribute('disabled') || sendBtn.getAttribute('aria-disabled') === 'true');
                 }, { timeout: 120000 });
@@ -779,11 +772,19 @@ async function eksekusiChatGPT(tipeTugas, promptTeks, isThinkingMode, fileInputD
         await page.waitForTimeout(400);
 
         const sinyalSebelumKirim = await bacaStatusTombolComposer(page);
-        const copyAwal = sinyalSebelumKirim.copyCount || 0;
+        copyAwal = sinyalSebelumKirim.copyCount || 0;
         console.log(`[CHATGPT] Ã°Å¸Å¡â‚¬ Mengirim tugas... btn=${sinyalSebelumKirim.status} aria="${sinyalSebelumKirim.aria}" copyAwal=${copyAwal}`);
         const how = await klikSendAtauEnter(page);
         console.log(`[CHATGPT] Ã°Å¸â€œÂ¤ Send method: ${how}`);
+        terkirim = await kirimTerkonfirmasi(page, promptTeks);
+        if (!terkirim) {
+            console.log('[CHATGPT] Kirim belum terjadi (masih tombol Kirim / prompt masih di kolom). Tidak masuk radar.');
+            continue;
+        }
+        console.log('[CHATGPT] Kirim terkonfirmasi');
         await stepShot(page, folderHasil, '08_after_send');
+        }
+        if (!terkirim) throw new Error('SEND_GAGAL: tombol Kirim tidak mengirim tugas');
 
         // Radar: selesai saat tombol suara kembali (Mulai Suara / Start Voice).
         // Jangan tunggu tombol Salin Ã¢â‚¬â€ di page pool aria/testid salin sering tidak cocok
