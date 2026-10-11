@@ -1,13 +1,13 @@
 /**
  * pool_browser.js
- * - Boot slot: langkah sama seperti chatgpt.js (goto â†’ stepShot â†’ profil â†’ composer) lalu HOLD page
- * - Saat tugas: JANGAN goto ulang. Pakai page yang sudah READY â†’ suntik prompt / mode / upload â†’ radar
+ * - Boot slot: langkah sama seperti chatgpt.js (goto Ã¢â€ â€™ stepShot Ã¢â€ â€™ profil Ã¢â€ â€™ composer) lalu HOLD page
+ * - Saat tugas: JANGAN goto ulang. Pakai page yang sudah READY Ã¢â€ â€™ suntik prompt / mode / upload Ã¢â€ â€™ radar
  */
 const path = require('path');
 const fs = require('fs');
 
 const POOL_SIZE = parseInt(process.env.POOL_SIZE || '5', 10);
-// Timeout cek sesi (login/signup vs composer) â€” 15 detik, lalu cookie berikutnya
+// Timeout cek sesi (login/signup vs composer) Ã¢â‚¬â€ 15 detik, lalu cookie berikutnya
 const SESI_TIMEOUT_MS = parseInt(process.env.POOL_SESI_TIMEOUT_MS || '15000', 10);
 const PROFIL_TIMEOUT_MS = parseInt(process.env.POOL_PROFIL_TIMEOUT_MS || String(SESI_TIMEOUT_MS), 10);
 const REBUILD_DELAY_MS = parseInt(process.env.POOL_REBUILD_DELAY_MS || '5000', 10);
@@ -33,7 +33,7 @@ async function stepShot(page, folderHasil, label) {
     const safe = String(label || 'step').replace(/[^a-zA-Z0-9_-]+/g, '_').slice(0, 60);
     const fp = path.join(folderHasil, `pool_${Date.now()}_${safe}.png`);
     await page.screenshot({ path: fp, fullPage: false }).catch(() => {});
-    console.log(`[POOL] ðŸ“¸ ${label} â†’ ${path.basename(fp)}`);
+    console.log(`[POOL] Ã°Å¸â€œÂ¸ ${label} Ã¢â€ â€™ ${path.basename(fp)}`);
   } catch (_) {}
 }
 
@@ -45,7 +45,7 @@ async function installPopupKiller(page) {
         const txt = (btn.textContent || '').trim().toLowerCase();
         if (
           txt === 'got it' ||
-          txt === 'çŸ¥é“äº†' ||
+          txt === 'Ã§Å¸Â¥Ã©Ââ€œÃ¤Âºâ€ ' ||
           txt === 'okay' ||
           txt === 'ok' ||
           txt === 'stay logged out' ||
@@ -59,7 +59,7 @@ async function installPopupKiller(page) {
         if (
           t.includes('More relevant') ||
           t.includes('personalized replies') ||
-          t.includes('ä¸ªæ€§åŒ–') ||
+          t.includes('Ã¤Â¸ÂªÃ¦â‚¬Â§Ã¥Å’â€“') ||
           t.includes('already uploaded')
         ) {
           const gotIt = Array.from(d.querySelectorAll('button')).find((b) =>
@@ -121,7 +121,7 @@ async function refreshReadySlot(slot) {
     await tungguComposerSiap(slot.page, 20000);
     console.log(`[POOL] slot#${slot.id} refresh selesai, tetap READY`);
   } catch (e) {
-    console.log(`[POOL] slot#${slot.id} refresh gagal (${e.message}) â€” cookie lain`);
+    console.log(`[POOL] slot#${slot.id} refresh gagal (${e.message}) Ã¢â‚¬â€ cookie lain`);
     slot.refreshing = false;
     slot.state = 'dead';
     destroySlot(slot)
@@ -166,7 +166,7 @@ async function klikAreaKosong(page) {
 /** Cookie invalid jika Login/Sign up. Timeout = COOKIE_INVALID (tidak dipaksa lanjut). */
 async function tungguSesiValid(page, timeoutMs) {
   const limit = timeoutMs || SESI_TIMEOUT_MS;
-  console.log(`[POOL] ðŸ” Cek sesi (max ${limit}ms; login/signup = invalid)...`);
+  console.log(`[POOL] Ã°Å¸â€Â Cek sesi (max ${limit}ms; login/signup = invalid)...`);
   const t0 = Date.now();
   let lastLog = 0;
   while (Date.now() - t0 < limit) {
@@ -186,23 +186,23 @@ async function tungguSesiValid(page, timeoutMs) {
       );
     }).catch(() => false);
     if (composer) {
-      console.log(`[POOL] âœ… Sesi OK ${Date.now() - t0}ms`);
+      console.log(`[POOL] Ã¢Å“â€¦ Sesi OK ${Date.now() - t0}ms`);
       return;
     }
     if (Date.now() - lastLog > 2500) {
       lastLog = Date.now();
-      console.log(`[POOL] sesiâ€¦ ${Date.now() - t0}ms`);
+      console.log(`[POOL] sesiÃ¢â‚¬Â¦ ${Date.now() - t0}ms`);
     }
     await page.waitForTimeout(400);
   }
   const auth2 = await deteksiLoginAtauSignup(page);
   if (auth2.hit) throw new Error('COOKIE_INVALID: ' + auth2.via);
-  // Jangan paksa lanjut â€” anggap cookie tidak aktif
+  // Jangan paksa lanjut Ã¢â‚¬â€ anggap cookie tidak aktif
   throw new Error('COOKIE_INVALID: sesi timeout ' + limit + 'ms (composer tidak siap)');
 }
 
 async function tungguComposerSiap(page, timeoutMs) {
-  console.log('[POOL] â³ Menunggu kolom teks (composer) siap...');
+  console.log('[POOL] Ã¢ÂÂ³ Menunggu kolom teks (composer) siap...');
   await page.waitForFunction(() => {
     const a = document.querySelector('#prompt-textarea');
     if (a) {
@@ -215,10 +215,10 @@ async function tungguComposerSiap(page, timeoutMs) {
       document.querySelector('[contenteditable="true"][aria-label="Ask ChatGPT"]')
     );
   }, { timeout: timeoutMs });
-  console.log('[POOL] âœ… Composer siap');
+  console.log('[POOL] Ã¢Å“â€¦ Composer siap');
 }
 
-/** Disalin dari chatgpt.js â€” fokus nyata + insertText / keyboard */
+/** Disalin dari chatgpt.js Ã¢â‚¬â€ fokus nyata + insertText / keyboard */
 async function suntikPromptKeComposer(page, promptTeks) {
   const clicked = await page.evaluate(() => {
     const visible = (el) => {
@@ -307,13 +307,13 @@ async function klikSendAtauEnter(page) {
   await page.waitForTimeout(500);
   if (await isGenerating()) return 'enter';
 
-  // 2) Klik send â€” berbagai selector
+  // 2) Klik send Ã¢â‚¬â€ berbagai selector
   const locs = [
     page.locator('[data-testid="send-button"]'),
     page.getByRole('button', { name: /send prompt|kirim perintah|^send$|^kirim$/i }),
     page.locator('button[aria-label*="Send" i]'),
     page.locator('button[aria-label*="Kirim" i]'),
-    // Tombol bulat composer (sering tanpa teks) â€” primary di kanan composer
+    // Tombol bulat composer (sering tanpa teks) Ã¢â‚¬â€ primary di kanan composer
     page.locator('form button.bg-composer-primary, button[class*="composer"][class*="rounded-full"]').last(),
   ];
   for (const loc of locs) {
@@ -349,7 +349,7 @@ async function destroySlot(slot) {
 }
 
 /**
- * Boot sampai profil+composer â€” page TETAP HIDUP (HOLD).
+ * Boot sampai profil+composer Ã¢â‚¬â€ page TETAP HIDUP (HOLD).
  * folderHasil untuk stepShot (opsional).
  */
 async function bootSlotOnce(slot, folderHasil) {
@@ -373,7 +373,7 @@ async function bootSlotOnce(slot, folderHasil) {
   await installPopupKiller(page);
 
   try {
-    console.log(`\n[POOL] ðŸŒ Membuka ChatGPT...`);
+    console.log(`\n[POOL] Ã°Å¸Å’Â Membuka ChatGPT...`);
     await page.goto('https://chatgpt.com/', { waitUntil: 'domcontentloaded', timeout: 90000 }).catch(() => {});
     await page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
     await stepShot(page, folderHasil, '01_after_goto');
@@ -395,7 +395,7 @@ async function bootSlotOnce(slot, folderHasil) {
 
   slot.browser = browser;
   slot.context = context;
-  slot.page = page; // HOLD â€” jangan ditutup
+  slot.page = page; // HOLD Ã¢â‚¬â€ jangan ditutup
   slot.cookieId = sesi.id;
   slot.readyAt = Date.now();
   slot.state = 'ready';
@@ -410,7 +410,7 @@ async function bootSlotLoop(slot, folderHasil) {
       await bootSlotOnce(slot, folderHasil);
       return;
     } catch (e) {
-      console.log(`[POOL] slot#${slot.id} boot gagal (${e.message}) â€” cookie lain dalam ${REBUILD_DELAY_MS}ms`);
+      console.log(`[POOL] slot#${slot.id} boot gagal (${e.message}) Ã¢â‚¬â€ cookie lain dalam ${REBUILD_DELAY_MS}ms`);
       await destroySlot(slot);
       await new Promise((r) => setTimeout(r, REBUILD_DELAY_MS));
     }
@@ -462,13 +462,13 @@ async function runTaskOnSlot(slot, { action, prompt, isThinkingMode, translatedF
   try {
     const url = page.url();
     if (!/chatgpt\.com/i.test(url)) {
-      throw new Error('page tidak di chatgpt.com â€” rebuild');
+      throw new Error('page tidak di chatgpt.com Ã¢â‚¬â€ rebuild');
     }
 
     // Keep-alive off selama tugas (hindari klik di tengah send/radar)
     stopKeepAlivePopupGuard(slot);
 
-    console.log(`[POOL] slot#${slot.id} â†’ chatgpt.js eksekusi (page held)`);
+    console.log(`[POOL] slot#${slot.id} Ã¢â€ â€™ chatgpt.js eksekusi (page held)`);
     const hasil = await deps.chatgptModule.eksekusiChatGPT(
       action || 'CHAT',
       prompt || '',
@@ -486,7 +486,7 @@ async function runTaskOnSlot(slot, { action, prompt, isThinkingMode, translatedF
   } finally {
     // Setelah tugas: rebuild slot (page bekas chat tidak di-hold ulang)
     const id = slot.id;
-    console.log(`[POOL] slot#${id} selesai tugas â†’ rebuild`);
+    console.log(`[POOL] slot#${id} selesai tugas Ã¢â€ â€™ rebuild`);
     slot.state = 'dead';
     const fh = folderHasil;
     destroySlot(slot)
