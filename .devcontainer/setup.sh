@@ -102,9 +102,9 @@ echo "[setup] npm done."
 
 echo "[setup] 4/5 Camoufox fetch..."
 mkdir -p "${CAMOUFOX_INSTALL_DIR:-/home/node/.cache/camoufox}"
-# Link resmi (contoh beta.33):
-# https://github.com/daijro/camoufox/releases/download/v156.0.1-beta.33/camoufox-156.0.1-beta.33-lin.x86_64.zip
-CAMOUFOX_PIN="${CAMOUFOX_VERSION:-v156.0.1-beta.33}"
+# Link resmi (pin beta.36):
+# https://github.com/daijro/camoufox/releases/download/v156.0.1-beta.36/camoufox-156.0.1-beta.36-lin.x86_64.zip
+CAMOUFOX_PIN="${CAMOUFOX_VERSION:-v156.0.1-beta.36}"
 VER_NUM="${CAMOUFOX_PIN#v}"
 DEST="${CAMOUFOX_INSTALL_DIR:-/home/node/.cache/camoufox}"
 ZIP_URL="https://github.com/daijro/camoufox/releases/download/${CAMOUFOX_PIN}/camoufox-${VER_NUM}-lin.x86_64.zip"
